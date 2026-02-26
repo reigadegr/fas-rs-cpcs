@@ -21,6 +21,10 @@ mod topapp;
 
 use std::time::Duration;
 
+use cpcs_analyzer::Analyzer as CpcsAnalyzer;
+use frame_analyzer::Analyzer;
+use looper::Looper;
+
 use super::{
     Extension,
     config::Config,
@@ -28,9 +32,6 @@ use super::{
     node::Node,
 };
 use crate::Controller;
-
-use frame_analyzer::Analyzer;
-use looper::Looper;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FasData {
@@ -76,7 +77,8 @@ impl Scheduler {
 
         let node = Node::init()?;
         let analyzer = Analyzer::new()?;
+        let cpcs_analyzer = CpcsAnalyzer::new()?;
 
-        Looper::new(analyzer, config, node, extension, controller).enter_loop()
+        Looper::new(analyzer, cpcs_analyzer, config, node, extension, controller).enter_loop()
     }
 }

@@ -36,17 +36,14 @@ use std::{
     process,
 };
 
-use framework::prelude::*;
-
 use anyhow::Result;
+use cpu_common::Controller;
 use flexi_logger::{DeferredNow, LogSpecification, Logger, Record};
-use log::{error, warn};
-use mimalloc::MiMalloc;
-
+use framework::prelude::*;
 #[cfg(debug_assertions)]
 use log::debug;
-
-use cpu_common::Controller;
+use log::{error, warn};
+use mimalloc::MiMalloc;
 use misc::setprop;
 
 #[global_allocator]

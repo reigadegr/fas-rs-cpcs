@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License along
 // with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 use std::{
-    cmp,
     collections::{HashMap, hash_map::Entry},
     fs,
     time::{Duration, Instant},
@@ -60,7 +59,6 @@ impl UsageTracker {
 pub struct ProcessMonitor {
     current_pid: Option<i32>,
     all_trackers: HashMap<i32, UsageTracker>,
-    top_trackers: HashMap<i32, UsageTracker>,
     last_full_update: Instant,
     last_update: Instant,
 }
@@ -70,7 +68,6 @@ impl ProcessMonitor {
         Self {
             current_pid: None,
             all_trackers: HashMap::new(),
-            top_trackers: HashMap::new(),
             last_full_update: Instant::now(),
             last_update: Instant::now(),
         }
@@ -80,7 +77,6 @@ impl ProcessMonitor {
         if self.current_pid != pid {
             self.current_pid = pid;
             self.all_trackers.clear();
-            self.top_trackers.clear();
             self.last_full_update = Instant::now();
             self.last_update = Instant::now();
         }
@@ -100,7 +96,7 @@ impl ProcessMonitor {
         }
 
         let mut util_max: f64 = 0.0;
-        for tracker in self.top_trackers.values_mut() {
+        for tracker in self.all_trackers.values_mut() {
             if let Ok(usage) = tracker.try_calculate() {
                 util_max = util_max.max(usage);
             }
@@ -124,28 +120,7 @@ impl ProcessMonitor {
                     ))
                 })
                 .collect();
-
-            let mut top_threads: Vec<_> = self
-                .all_trackers
-                .iter()
-                .filter_map(|(tid, tracker)| Some((*tid, tracker.clone().try_calculate().ok()?)))
-                .collect();
-
-            top_threads.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(cmp::Ordering::Equal));
-            top_threads.truncate(8);
-
-            self.top_trackers = top_threads
-                .into_iter()
-                .filter_map(|(tid, _)| match self.top_trackers.entry(tid) {
-                    Entry::Occupied(o) => Some((tid, o.remove())),
-                    Entry::Vacant(_) => Some((tid, UsageTracker::new(pid, tid).ok()?)),
-                })
-                .collect();
         }
-    }
-
-    pub fn top_threads(&self) -> impl Iterator<Item = i32> {
-        self.top_trackers.keys().copied()
     }
 }
 

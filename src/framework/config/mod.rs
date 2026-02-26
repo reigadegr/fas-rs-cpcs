@@ -22,13 +22,13 @@ mod read;
 
 use std::{fs, path::Path, sync::mpsc, thread};
 
+pub use data::{ConfigData, MarginFps, ModeConfig, TemperatureThreshold};
 use inner::Inner;
 use log::{error, info};
+use read::wait_and_read;
 use toml::Value;
 
 use crate::framework::{error::Result, node::Mode};
-pub use data::{ConfigData, MarginFps, ModeConfig, TemperatureThreshold};
-use read::wait_and_read;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetFps {

@@ -24,8 +24,9 @@ use std::{
     thread,
 };
 
-use crate::framework::error::Result;
 pub use api::Api;
+
+use crate::framework::error::Result;
 
 const EXTENSIONS_PATH: &str = "/dev/fas_rs/extensions";
 

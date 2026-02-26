@@ -7,9 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::framework::error::{Error, Result};
 use likely_stable::unlikely;
 pub use power_mode::Mode;
+
+use crate::framework::error::{Error, Result};
 
 const NODE_PATH: &str = "/dev/fas_rs";
 const REFRESH_TIME: Duration = Duration::from_secs(1);

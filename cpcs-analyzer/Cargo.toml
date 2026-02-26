@@ -1,0 +1,18 @@
+[package]
+name = "cpcs-analyzer"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0.101"
+aya = "0.13.1"
+cpcs-analyzer-common = { path = "../cpcs-analyzer-common", features = ["user"] }
+ctor = "0.4.3"
+libc = "0.2.180"
+log = "0.4.29"
+mio = { version = "1.0.3", features = ["os-ext"] }
+
+[build-dependencies]
+anyhow = "1.0.101"
+cpcs-analyzer-ebpf = { path = "../cpcs-analyzer-ebpf" }

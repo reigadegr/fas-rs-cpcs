@@ -27,7 +27,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use fs_extra::{dir, file};
 use zip::{CompressionMethod, write::FileOptions};
-
 use zip_ext::zip_create_from_directory_with_options;
 
 #[derive(Parser)]
@@ -115,7 +114,8 @@ fn main() -> Result<()> {
 }
 
 fn build(release: bool, verbose: bool) -> Result<()> {
-    let temp_dir = temp_dir(release);
+    let output_root = output_root_dir()?;
+    let temp_dir = temp_dir(&output_root, release);
 
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir)?;
@@ -146,31 +146,28 @@ fn build(release: bool, verbose: bool) -> Result<()> {
         &module_dir,
         &temp_dir,
         &dir::CopyOptions::new().overwrite(true).content_only(true),
-    )
-    .unwrap();
-    fs::remove_file(temp_dir.join(".gitignore")).unwrap();
+    )?;
+    fs::remove_file(temp_dir.join(".gitignore"))?;
     file::copy(
         bin_path(release),
         temp_dir.join("fas-rs"),
         &file::CopyOptions::new().overwrite(true),
-    )
-    .unwrap();
+    )?;
 
     build_webui()?;
     dir::copy(
         webroot_dir(),
         &temp_dir,
         &dir::CopyOptions::new().overwrite(true),
-    )
-    .unwrap();
+    )?;
 
     let build_type = if release { "release" } else { "debug" };
-    let package_path = Path::new("output").join(format!("fas-rs({build_type}).zip"));
+    let package_path = output_root.join(format!("fas-rs({build_type}).zip"));
 
     let options: FileOptions<'_, ()> = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(9));
-    zip_create_from_directory_with_options(&package_path, &temp_dir, |_| options).unwrap();
+    zip_create_from_directory_with_options(&package_path, &temp_dir, |_| options)?;
 
     println!("fas-rs built successfully: {:?}", package_path);
 
@@ -204,7 +201,7 @@ fn check(release: bool, verbose: bool) -> Result<()> {
 }
 
 fn clean() -> Result<()> {
-    let temp_dir = temp_dir(false);
+    let temp_dir = temp_dir(Path::new("output"), false);
     let _ = fs::remove_dir_all(&temp_dir);
 
     Command::new("cargo").arg("clean").spawn()?.wait()?;
@@ -258,8 +255,8 @@ fn module_dir() -> PathBuf {
     Path::new("module").to_path_buf()
 }
 
-fn temp_dir(release: bool) -> PathBuf {
-    Path::new("output")
+fn temp_dir(output_root: &Path, release: bool) -> PathBuf {
+    output_root
         .join(".temp")
         .join(if release { "release" } else { "debug" })
 }
@@ -281,6 +278,31 @@ fn cargo_ndk() -> Command {
 
 fn webroot_dir() -> PathBuf {
     Path::new("webui").join("webroot")
+}
+
+fn output_root_dir() -> Result<PathBuf> {
+    let preferred = Path::new("output").to_path_buf();
+    if ensure_writable_dir(&preferred).is_ok() {
+        return Ok(preferred);
+    }
+
+    let fallback = Path::new("target").join("xtask-output");
+    ensure_writable_dir(&fallback)?;
+    println!(
+        "output/ not writable, falling back to {:?}",
+        fallback.as_path()
+    );
+    Ok(fallback)
+}
+
+fn ensure_writable_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+
+    let probe = path.join(".xtask_write_probe");
+    fs::write(&probe, b"probe")?;
+    fs::remove_file(probe)?;
+
+    Ok(())
 }
 
 fn build_webui() -> Result<()> {

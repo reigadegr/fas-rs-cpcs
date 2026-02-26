@@ -19,13 +19,19 @@ mod buffer;
 mod clean;
 mod policy;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc::RecvTimeoutError,
+    time::{Duration, Instant},
+};
 
+use buffer::{Buffer, BufferWorkingState};
+use clean::Cleaner;
+use cpcs_analyzer::Analyzer as CpcsAnalyzer;
 use frame_analyzer::Analyzer;
 use likely_stable::{likely, unlikely};
 #[cfg(debug_assertions)]
 use log::debug;
-use log::info;
+use log::{info, warn};
 use policy::{ControllerParams, controll::calculate_control};
 
 use super::{FasData, thermal::Thermal, topapp::TopAppsWatcher};
@@ -41,12 +47,10 @@ use crate::{
     },
 };
 
-use buffer::{Buffer, BufferWorkingState};
-use clean::Cleaner;
-
 const DELAY_TIME: Duration = Duration::from_secs(3);
+const CPCS_ENABLED: bool = true;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum State {
     NotWorking,
     Waiting,
@@ -66,6 +70,11 @@ struct AnalyzerState {
     restart_timer: Instant,
 }
 
+struct CpcsState {
+    analyzer: CpcsAnalyzer,
+    last_missing_log: Instant,
+}
+
 struct ControllerState {
     controller: Controller,
     params: ControllerParams,
@@ -73,8 +82,16 @@ struct ControllerState {
     usage_sample_timer: Instant,
 }
 
+struct DiagState {
+    last_log: Instant,
+    frame_events: u64,
+    cpcs_updates: u64,
+    policy_calls: u64,
+}
+
 pub struct Looper {
     analyzer_state: AnalyzerState,
+    cpcs_state: CpcsState,
     config: Config,
     node: Node,
     extension: Extension,
@@ -83,21 +100,31 @@ pub struct Looper {
     cleaner: Cleaner,
     fas_state: FasState,
     controller_state: ControllerState,
+    diag_state: DiagState,
 }
 
 impl Looper {
     pub fn new(
         analyzer: Analyzer,
+        cpcs_analyzer: CpcsAnalyzer,
         config: Config,
         node: Node,
         extension: Extension,
         controller: Controller,
     ) -> Self {
+        if !CPCS_ENABLED {
+            info!("CPCS integration temporarily disabled");
+        }
+
         Self {
             analyzer_state: AnalyzerState {
                 analyzer,
                 restart_counter: 0,
                 restart_timer: Instant::now(),
+            },
+            cpcs_state: CpcsState {
+                analyzer: cpcs_analyzer,
+                last_missing_log: Instant::now(),
             },
             config,
             node,
@@ -117,13 +144,25 @@ impl Looper {
                 target_fps_offset: 0.0,
                 usage_sample_timer: Instant::now(),
             },
+            diag_state: DiagState {
+                last_log: Instant::now(),
+                frame_events: 0,
+                cpcs_updates: 0,
+                policy_calls: 0,
+            },
         }
     }
 
     pub fn enter_loop(&mut self) -> Result<()> {
         loop {
             self.switch_mode();
-            let _ = self.update_analyzer();
+            if let Err(e) = self.update_analyzer() {
+                warn!("update analyzer failed: {e:#}");
+            }
+            self.diag_state.cpcs_updates = self
+                .diag_state
+                .cpcs_updates
+                .saturating_add(self.refresh_cpcs_weights() as u64);
             self.retain_topapp();
 
             if self.windows_watcher.visible_freeform_window() {
@@ -131,6 +170,7 @@ impl Looper {
             }
 
             if let Some(data) = self.recv_message() {
+                self.diag_state.frame_events = self.diag_state.frame_events.saturating_add(1);
                 #[cfg(debug_assertions)]
                 debug!("original frametime: {:?}", data.frametime);
                 if let Some(state) = self.buffer_update(&data) {
@@ -152,6 +192,8 @@ impl Looper {
                     BufferWorkingState::Usable => self.do_policy(),
                 }
             }
+
+            self.emit_diagnostics_if_needed();
         }
     }
 
@@ -183,9 +225,35 @@ impl Looper {
             let pkg = get_process_name(pid)?;
             if self.config.need_fas(&pkg) {
                 self.analyzer_state.analyzer.attach_app(pid)?;
+                if CPCS_ENABLED {
+                    self.cpcs_state.analyzer.attach_app(pid)?;
+                }
             }
         }
         Ok(())
+    }
+
+    fn refresh_cpcs_weights(&mut self) -> usize {
+        if !CPCS_ENABLED {
+            return 0;
+        }
+
+        let mut updates = 0usize;
+        loop {
+            match self
+                .cpcs_state
+                .analyzer
+                .recv_timeout(Duration::from_millis(0))
+            {
+                Ok(_) => updates = updates.saturating_add(1),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    warn!("cpcs analyzer disconnected");
+                    break;
+                }
+            }
+        }
+        updates
     }
 
     fn restart_analyzer(&mut self) {
@@ -208,18 +276,19 @@ impl Looper {
             return;
         }
 
-        let (control, is_janked) = if let Some(buffer) = &self.fas_state.buffer {
+        let (pid, control, is_janked) = if let Some(buffer) = &self.fas_state.buffer {
             let target_fps_offset = self
                 .therminal
                 .target_fps_offset(&mut self.config, self.fas_state.mode);
-            calculate_control(
+            let result = calculate_control(
                 buffer,
                 &mut self.config,
                 self.fas_state.mode,
                 &mut self.controller_state,
                 target_fps_offset,
             )
-            .unwrap_or_default()
+            .unwrap_or_default();
+            (buffer.package_info.pid, result.0, result.1)
         } else {
             return;
         };
@@ -227,9 +296,78 @@ impl Looper {
         #[cfg(debug_assertions)]
         debug!("control: {control}khz");
 
+        let weights = if CPCS_ENABLED {
+            let weights = self
+                .cpcs_state
+                .analyzer
+                .latest_for(pid)
+                .map(|weights| &weights.policy_weights);
+            if weights.is_none()
+                && self.cpcs_state.last_missing_log.elapsed() >= Duration::from_secs(1)
+            {
+                self.cpcs_state.last_missing_log = Instant::now();
+                warn!("cpcs weights unavailable for pid={pid}");
+            }
+            weights
+        } else {
+            None
+        };
+
         self.controller_state
             .controller
-            .fas_update_freq(control, is_janked);
+            .fas_update_freq_weighted(control, is_janked, weights);
+        self.diag_state.policy_calls = self.diag_state.policy_calls.saturating_add(1);
+    }
+
+    fn emit_diagnostics_if_needed(&mut self) {
+        if self.diag_state.last_log.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+
+        let frame_events = self.diag_state.frame_events;
+        let cpcs_updates = self.diag_state.cpcs_updates;
+        let policy_calls = self.diag_state.policy_calls;
+        self.diag_state.last_log = Instant::now();
+        self.diag_state.frame_events = 0;
+        self.diag_state.cpcs_updates = 0;
+        self.diag_state.policy_calls = 0;
+
+        let topapps = self.windows_watcher.topapp_pids().len();
+        let frame_analyzer_attached = self.analyzer_state.analyzer.pids().count();
+        let cpcs_attached = if CPCS_ENABLED {
+            self.cpcs_state.analyzer.pids().count()
+        } else {
+            0
+        };
+
+        if let Some(buffer) = self.fas_state.buffer.as_ref() {
+            info!(
+                "diag state={:?} topapps={} frame_attached={} cpcs_attached={} frame_events_5s={} cpcs_updates_5s={} policy_calls_5s={} buf_state={:?} target_fps={:?} fps_short={:.1} fps_long={:.1} frames_cached={}",
+                self.fas_state.working_state,
+                topapps,
+                frame_analyzer_attached,
+                cpcs_attached,
+                frame_events,
+                cpcs_updates,
+                policy_calls,
+                buffer.state.working_state,
+                buffer.target_fps_state.target_fps,
+                buffer.frametime_state.current_fps_short,
+                buffer.frametime_state.current_fps_long,
+                buffer.frametime_state.frametimes.len()
+            );
+        } else {
+            info!(
+                "diag state={:?} topapps={} frame_attached={} cpcs_attached={} frame_events_5s={} cpcs_updates_5s={} policy_calls_5s={} no_buffer",
+                self.fas_state.working_state,
+                topapps,
+                frame_analyzer_attached,
+                cpcs_attached,
+                frame_events,
+                cpcs_updates,
+                policy_calls
+            );
+        }
     }
 
     pub fn retain_topapp(&mut self) {
@@ -243,6 +381,9 @@ impl Looper {
                     .analyzer_state
                     .analyzer
                     .detach_app(buffer.package_info.pid);
+                if CPCS_ENABLED {
+                    let _ = self.cpcs_state.analyzer.detach_app(buffer.package_info.pid);
+                }
                 let pkg = buffer.package_info.pkg.clone();
                 trigger_unload_fas(&self.extension, buffer.package_info.pid, pkg);
                 self.fas_state.buffer = None;

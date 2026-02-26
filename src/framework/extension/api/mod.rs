@@ -23,12 +23,13 @@ pub mod v2;
 pub mod v3;
 pub mod v4;
 
-use super::{Extension, core::ExtensionMap};
 pub use v0::ApiV0;
 use v1::ApiV1;
 use v2::ApiV2;
 use v3::ApiV3;
 use v4::ApiV4;
+
+use super::{Extension, core::ExtensionMap};
 
 pub trait Api: Send {
     fn handle_api(&self, ext: &ExtensionMap);

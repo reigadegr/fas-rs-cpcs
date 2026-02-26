@@ -16,7 +16,8 @@
 # with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 
 [workspace]
-members = ["xtask"]
+members = ["xtask", "cpcs-analyzer", "cpcs-analyzer-common", "cpcs-analyzer-ebpf"]
+default-members = [".", "xtask", "cpcs-analyzer"]
 
 [package]
 name = "fas-rs"
@@ -42,11 +43,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 sys-mount = { version = "3.0.1", default-features = false }
 quick-xml = { version = "0.39.0", features = ["serialize"] }
 mlua = { version = "0.11.6", features = ["luajit", "vendored", "error-send"] }
-frame-analyzer = "0.3.4"
+frame-analyzer = { path = "third_party/frame-analyzer-patched" }
 dumpsys-rs = { git = "https://github.com/shadow3aaa/dumpsys-rs" }
 mimalloc = { version = "0.1.48", features = ["no_thp", "override"] }
 num_cpus = "1.17.0"
 nix = { version = "0.31.1", features = ["sched"] }
+cpcs-analyzer = { path = "cpcs-analyzer" }
 
 [build-dependencies]
 anyhow = "1.0.101"

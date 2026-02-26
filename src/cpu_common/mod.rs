@@ -29,13 +29,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use cpu_info::Info;
+use extra_policy::ExtraPolicy;
 #[cfg(debug_assertions)]
 use log::debug;
-use log::warn;
-use nix::{
-    sched::{CpuSet, sched_getaffinity},
-    unistd::Pid,
-};
+use log::{info, warn};
 use parking_lot::Mutex;
 use process_monitor::ProcessMonitor;
 
@@ -44,8 +42,6 @@ use crate::{
     api::{trigger_init_cpu_freq, trigger_reset_cpu_freq},
     file_handler::FileHandler,
 };
-use cpu_info::Info;
-use extra_policy::ExtraPolicy;
 
 pub static EXTRA_POLICY_MAP: OnceLock<HashMap<i32, Mutex<ExtraPolicy>>> = OnceLock::new();
 pub static IGNORE_MAP: OnceLock<HashMap<i32, AtomicBool>> = OnceLock::new();
@@ -156,40 +152,186 @@ impl Controller {
         self.util_max = None;
     }
 
-    pub fn fas_update_freq(&mut self, control: isize, is_janked: bool) {
+    pub fn fas_update_freq_weighted(
+        &mut self,
+        control: isize,
+        is_janked: bool,
+        policy_weights: Option<&HashMap<i32, f64>>,
+    ) {
         #[cfg(debug_assertions)]
         debug!("change freq: {control}");
 
-        let fas_freqs = self.compute_target_frequencies(control, is_janked);
+        let base_freqs = self.compute_target_frequencies(control, is_janked);
+        let weighted_freqs = self.apply_policy_weights(base_freqs.clone(), policy_weights);
         let sorted_policies = self.sort_policies_topologically();
-        let fas_freqs = Self::apply_absolute_constraints(fas_freqs, &sorted_policies);
-        let fas_freqs = Self::apply_relative_constraints(fas_freqs, &sorted_policies);
-        let top_used_cores = self.top_used_cores().unwrap_or_else(|| {
-            let mut all_cores = CpuSet::new();
-            for core in 0..num_cpus::get() {
-                all_cores.set(core).unwrap();
-            }
-            all_cores
-        });
+        let constrained_freqs = Self::apply_relative_constraints(
+            Self::apply_absolute_constraints(weighted_freqs, &sorted_policies),
+            &sorted_policies,
+        );
 
-        if no_extra_policy() {
-            let fas_freq_max = fas_freqs.values().max().copied().unwrap();
-            for cpu in &mut self.cpu_infos {
-                if let Some(freq) = fas_freqs.get(&cpu.policy).copied() {
-                    let freq = freq.clamp(
-                        fas_freq_max.saturating_sub(100_000),
-                        fas_freq_max.saturating_add(100_000),
-                    );
-                    let _ = cpu.write_freq(top_used_cores, freq, &mut self.file_handler);
-                }
-            }
+        // Keep legacy no-extra-policy clamp for non-CPCS path.
+        // When CPCS weights are available, preserve inter-policy skew so
+        // critical-path weighting can take effect.
+        let write_freqs = if no_extra_policy() && policy_weights.is_none() {
+            let fas_freq_max = constrained_freqs
+                .values()
+                .max()
+                .copied()
+                .unwrap_or_default();
+            constrained_freqs
+                .iter()
+                .map(|(policy, freq)| {
+                    let freq = *freq;
+                    (
+                        *policy,
+                        freq.clamp(
+                            fas_freq_max.saturating_sub(100_000),
+                            fas_freq_max.saturating_add(100_000),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
         } else {
-            for cpu in &mut self.cpu_infos {
-                if let Some(freq) = fas_freqs.get(&cpu.policy).copied() {
-                    let _ = cpu.write_freq(top_used_cores, freq, &mut self.file_handler);
-                }
+            constrained_freqs.clone()
+        };
+
+        if let Some(weights) = policy_weights {
+            info!(
+                "cpcs control={}khz weights=[{}] base=[{}] final=[{}]",
+                control,
+                Self::format_policy_weights(weights),
+                Self::format_policy_freqs(&base_freqs),
+                Self::format_policy_freqs(&write_freqs)
+            );
+        }
+
+        for cpu in &mut self.cpu_infos {
+            if let Some(freq) = write_freqs.get(&cpu.policy).copied() {
+                let _ = cpu.write_freq(freq, &mut self.file_handler);
             }
         }
+    }
+
+    fn apply_policy_weights(
+        &self,
+        freqs: HashMap<i32, isize>,
+        weights: Option<&HashMap<i32, f64>>,
+    ) -> HashMap<i32, isize> {
+        let Some(weights) = weights else {
+            return freqs;
+        };
+        if freqs.is_empty() {
+            return freqs;
+        }
+
+        let mut out = freqs.clone();
+        let mut policies = Vec::with_capacity(freqs.len());
+        let mut mins = Vec::with_capacity(freqs.len());
+        let mut caps = Vec::with_capacity(freqs.len());
+        let mut alloc = Vec::with_capacity(freqs.len());
+        let mut ws = Vec::with_capacity(freqs.len());
+
+        let mut total_budget = 0.0f64;
+        let mut total_weight = 0.0f64;
+
+        for (policy, base_freq) in &freqs {
+            let Some(info) = self.cpu_infos.iter().find(|cpu| cpu.policy == *policy) else {
+                continue;
+            };
+            let Some(min_freq) = info.freqs.first().copied() else {
+                continue;
+            };
+            let Some(max_freq) = info.freqs.last().copied() else {
+                continue;
+            };
+
+            let min_f = min_freq as f64;
+            let cap = max_freq.saturating_sub(min_freq).max(0) as f64;
+            let base_clamped = (*base_freq).clamp(min_freq, max_freq);
+            let base_budget = base_clamped.saturating_sub(min_freq).max(0) as f64;
+            let w = weights.get(policy).copied().unwrap_or(0.0).max(0.0);
+
+            policies.push(*policy);
+            mins.push(min_f);
+            caps.push(cap);
+            alloc.push(0.0);
+            ws.push(w);
+            total_budget += base_budget;
+            total_weight += w;
+        }
+        if policies.is_empty() || total_budget <= f64::EPSILON || total_weight <= f64::EPSILON {
+            return out;
+        }
+
+        let mut remaining_budget = total_budget;
+        let mut active: Vec<usize> = (0..policies.len()).collect();
+
+        while remaining_budget > f64::EPSILON && !active.is_empty() {
+            let active_weight_sum = active.iter().map(|idx| ws[*idx]).sum::<f64>();
+
+            let mut distributed = 0.0f64;
+            let mut next_active = Vec::with_capacity(active.len());
+            for idx in active.iter().copied() {
+                let available = caps[idx] - alloc[idx];
+                if available <= f64::EPSILON {
+                    continue;
+                }
+
+                let share = if active_weight_sum <= f64::EPSILON {
+                    remaining_budget / active.len() as f64
+                } else {
+                    remaining_budget * (ws[idx] / active_weight_sum)
+                };
+                let give = share.min(available);
+                if give <= f64::EPSILON {
+                    continue;
+                }
+
+                alloc[idx] += give;
+                distributed += give;
+
+                if caps[idx] - alloc[idx] > f64::EPSILON {
+                    next_active.push(idx);
+                }
+            }
+
+            if distributed <= f64::EPSILON {
+                break;
+            }
+            remaining_budget -= distributed;
+            active = next_active;
+        }
+
+        for idx in 0..policies.len() {
+            let target = (mins[idx] + alloc[idx]).round() as isize;
+            out.insert(policies[idx], target);
+        }
+
+        out
+    }
+
+    fn format_policy_freqs(freqs: &HashMap<i32, isize>) -> String {
+        let mut policies: Vec<_> = freqs.keys().copied().collect();
+        policies.sort_unstable();
+        policies
+            .into_iter()
+            .filter_map(|policy| freqs.get(&policy).map(|freq| format!("p{policy}={freq}")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn format_policy_weights(weights: &HashMap<i32, f64>) -> String {
+        let mut policies: Vec<_> = weights.keys().copied().collect();
+        policies.sort_unstable();
+        policies
+            .into_iter()
+            .filter_map(|policy| {
+                weights
+                    .get(&policy)
+                    .map(|weight| format!("p{policy}={weight:.3}"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn update_util_max(&mut self) {
@@ -301,48 +443,6 @@ impl Controller {
         );
 
         sorted_policies
-    }
-
-    fn top_used_cores(&self) -> Option<CpuSet> {
-        let top_threads_cpu_sets: Vec<_> = self
-            .process_monitor
-            .top_threads()
-            .filter_map(|tid| sched_getaffinity(Pid::from_raw(tid)).ok())
-            .collect();
-
-        let mut counts = HashMap::new();
-        for cpu_set in top_threads_cpu_sets.iter().copied() {
-            *counts.entry(cpu_set).or_insert(0) += 1;
-        }
-
-        if counts.len() <= 1 {
-            let mut top_used_cores = CpuSet::new();
-            for cpuset in top_threads_cpu_sets {
-                for core in 0..num_cpus::get() {
-                    if cpuset.is_set(core).unwrap() {
-                        top_used_cores.set(core).unwrap();
-                    }
-                }
-            }
-
-            return Some(top_used_cores);
-        }
-
-        let (mode, _) = counts.into_iter().max_by_key(|&(_num, count)| count)?;
-
-        let mut top_used_cores = CpuSet::new();
-        for cpuset in top_threads_cpu_sets
-            .into_iter()
-            .filter(|cpu_set| *cpu_set != mode)
-        {
-            for core in 0..num_cpus::get() {
-                if cpuset.is_set(core).unwrap() {
-                    top_used_cores.set(core).unwrap();
-                }
-            }
-        }
-
-        Some(top_used_cores)
     }
 
     fn apply_absolute_constraints(
