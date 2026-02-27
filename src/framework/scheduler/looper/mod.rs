@@ -20,7 +20,6 @@ mod clean;
 mod policy;
 
 use std::{
-    sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
 
@@ -48,8 +47,6 @@ use crate::{
 };
 
 const DELAY_TIME: Duration = Duration::from_secs(3);
-const CPCS_ENABLED: bool = true;
-
 #[derive(PartialEq, Debug)]
 enum State {
     NotWorking,
@@ -202,19 +199,13 @@ impl Looper {
             let pkg = get_process_name(pid)?;
             if self.config.need_fas(&pkg) {
                 self.analyzer_state.analyzer.attach_app(pid)?;
-                if CPCS_ENABLED {
-                    self.cpcs_state.analyzer.attach_app(pid)?;
-                }
+                self.cpcs_state.analyzer.attach_app(pid)?;
             }
         }
         Ok(())
     }
 
     fn refresh_cpcs_weights(&mut self) -> usize {
-        if !CPCS_ENABLED {
-            return 0;
-        }
-
         let mut updates = 0usize;
         loop {
             match self
@@ -223,8 +214,8 @@ impl Looper {
                 .recv_timeout(Duration::from_millis(0))
             {
                 Ok(_) => updates = updates.saturating_add(1),
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     warn!("cpcs analyzer disconnected");
                     break;
                 }
@@ -303,14 +294,11 @@ impl Looper {
             return;
         };
 
-        let weights = if CPCS_ENABLED {
-            self.cpcs_state
-                .analyzer
-                .latest_for(pid)
-                .map(|weights| &weights.policy_weights)
-        } else {
-            None
-        };
+        let weights = self
+            .cpcs_state
+            .analyzer
+            .latest_for(pid)
+            .map(|weights| &weights.policy_weights);
 
         self.controller_state.controller.fas_update_freq_weighted(
             control_ratio,
@@ -338,9 +326,7 @@ impl Looper {
                     .analyzer_state
                     .analyzer
                     .detach_app(buffer.package_info.pid);
-                if CPCS_ENABLED {
-                    let _ = self.cpcs_state.analyzer.detach_app(buffer.package_info.pid);
-                }
+                let _ = self.cpcs_state.analyzer.detach_app(buffer.package_info.pid);
                 let pkg = buffer.package_info.pkg.clone();
                 trigger_unload_fas(&self.extension, buffer.package_info.pid, pkg);
                 self.fas_state.buffer = None;
