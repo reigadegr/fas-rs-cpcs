@@ -20,10 +20,28 @@ pub mod controll;
 #[derive(Debug, Copy, Clone)]
 pub struct ControllerParams {
     pub kp: f64,
+    pub error_ema_alpha: f64,
+    pub error_clip_ratio: f64,
 }
 
 impl Default for ControllerParams {
     fn default() -> Self {
-        Self { kp: 0.000_3 }
+        Self {
+            kp: 0.4,
+            error_ema_alpha: 0.5,
+            error_clip_ratio: 0.8,
+        }
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct ControlOutput {
+    pub control_ratio: f64,
+    pub is_janked: bool,
+    pub adjusted_target_fps: f64,
+    pub target_fps_offset: f64,
+    pub normalized_frame_ms: f64,
+    pub normalized_error_ms: f64,
+    pub normalized_error_ratio: f64,
+    pub normalized_error_ratio_smooth: f64,
 }

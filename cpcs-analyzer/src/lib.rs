@@ -76,9 +76,13 @@ impl Default for AnalyzerConfig {
             uprobe_symbol: DEFAULT_UPROBE_SYMBOL.to_string(),
             uprobe_lib: DEFAULT_UPROBE_LIB.to_string(),
             ema_lambda: 0.8,
-            rq_weight: 0.25,
-            futex_weight: 0.45,
-            exec_weight: 0.30,
+            // Runqueue delay is retained for diagnosis, but does not directly
+            // participate in DVFS weight scoring by default.
+            rq_weight: 0.0,
+            // Futex time remains part of DAG/critical-subgraph extraction, but
+            // does not directly participate in DVFS weight scoring.
+            futex_weight: 0.0,
+            exec_weight: 0.75,
             subgraph_slack_ns: 300_000,
             subgraph_tau_ns: 300_000,
             norm_mix: 0.3,
@@ -292,8 +296,8 @@ fn validate_config(cfg: &AnalyzerConfig) -> Result<()> {
     if cfg.rq_weight < 0.0 || cfg.futex_weight < 0.0 || cfg.exec_weight < 0.0 {
         return Err(anyhow!("rq/futex/exec weights must be >= 0"));
     }
-    if cfg.rq_weight + cfg.futex_weight + cfg.exec_weight <= 0.0 {
-        return Err(anyhow!("at least one of rq/futex/exec weight must be > 0"));
+    if cfg.rq_weight + cfg.exec_weight <= 0.0 {
+        return Err(anyhow!("at least one of rq/exec weight must be > 0"));
     }
     if cfg.subgraph_tau_ns == 0 {
         return Err(anyhow!("subgraph_tau_ns must be > 0"));
@@ -1094,7 +1098,7 @@ fn analyze_cluster_weights(
     ema_scores: &mut HashMap<u32, f64>,
     ema_lambda: f64,
     rq_weight: f64,
-    futex_weight: f64,
+    _futex_weight: f64,
     exec_weight: f64,
     norm_mix: f64,
     min_cluster_weight: f64,
@@ -1104,10 +1108,7 @@ fn analyze_cluster_weights(
     for policy in policies {
         let exec = *frame.policy_exec_ns.get(policy).unwrap_or(&0);
         let rq = *frame.policy_rq_delay_ns.get(policy).unwrap_or(&0);
-        let futex = *frame.policy_futex_wait_ns.get(policy).unwrap_or(&0);
-
-        let raw_score =
-            exec_weight * exec as f64 + rq_weight * rq as f64 + futex_weight * futex as f64;
+        let raw_score = exec_weight * exec as f64 + rq_weight * rq as f64;
         let prev = *ema_scores.get(policy).unwrap_or(&0.0);
         let smooth_raw = ema_lambda * prev + (1.0 - ema_lambda) * raw_score;
         ema_scores.insert(*policy, smooth_raw);

@@ -48,11 +48,11 @@ pub static IGNORE_MAP: OnceLock<HashMap<i32, AtomicBool>> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Controller {
-    max_freq: isize,
     cpu_infos: Vec<Info>,
     file_handler: FileHandler,
     process_monitor: ProcessMonitor,
     util_max: Option<f64>,
+    total_budget_khz: Option<isize>,
 }
 
 impl Controller {
@@ -76,19 +76,12 @@ impl Controller {
         #[cfg(debug_assertions)]
         debug!("cpu infos: {cpu_infos:?}");
 
-        let max_freq = cpu_infos
-            .iter()
-            .flat_map(|info| info.freqs.iter())
-            .max()
-            .copied()
-            .unwrap_or(0);
-
         Ok(Self {
-            max_freq,
             cpu_infos,
             file_handler: FileHandler::new(),
             process_monitor: ProcessMonitor::new(),
             util_max: None,
+            total_budget_khz: None,
         })
     }
 
@@ -143,6 +136,7 @@ impl Controller {
         self.reset_all_cpu_freq();
         self.process_monitor.set_pid(Some(pid));
         self.util_max = None;
+        self.total_budget_khz = None;
     }
 
     pub fn init_default(&mut self, extension: &Extension) {
@@ -150,19 +144,33 @@ impl Controller {
         self.reset_all_cpu_freq();
         self.process_monitor.set_pid(None);
         self.util_max = None;
+        self.total_budget_khz = None;
     }
 
     pub fn fas_update_freq_weighted(
         &mut self,
-        control: isize,
+        control_ratio: f64,
         is_janked: bool,
         policy_weights: Option<&HashMap<i32, f64>>,
+        adjusted_target_fps: Option<f64>,
+        target_fps_offset: Option<f64>,
+        fps_short: Option<f64>,
+        fps_long: Option<f64>,
+        normalized_frame_ms: Option<f64>,
+        normalized_error_ms: Option<f64>,
+        normalized_error_ratio: Option<f64>,
+        normalized_error_ratio_smooth: Option<f64>,
     ) {
         #[cfg(debug_assertions)]
-        debug!("change freq: {control}");
+        debug!("change ratio: {control_ratio}");
 
-        let base_freqs = self.compute_target_frequencies(control, is_janked);
-        let weighted_freqs = self.apply_policy_weights(base_freqs.clone(), policy_weights);
+        let (base_freqs, total_budget_khz, util_cap_hit) =
+            self.compute_target_frequencies(control_ratio, is_janked);
+        let weighted_freqs = if let Some(weights) = policy_weights {
+            self.distribute_budget(total_budget_khz as f64, Some(weights))
+        } else {
+            base_freqs.clone()
+        };
         let sorted_policies = self.sort_policies_topologically();
         let constrained_freqs = Self::apply_relative_constraints(
             Self::apply_absolute_constraints(weighted_freqs, &sorted_policies),
@@ -197,8 +205,38 @@ impl Controller {
 
         if let Some(weights) = policy_weights {
             info!(
-                "cpcs control={}khz weights=[{}] base=[{}] final=[{}]",
-                control,
+                "cpcs control_ratio={} control_ppm={} budget_khz={} util_max={} util_cap_hit={} adjusted_target_fps={} target_fps_offset={} fps_short={} fps_long={} norm_frame_ms={} norm_err_ms={} norm_err_ratio={} norm_err_ratio_smooth={} weights=[{}] base=[{}] final=[{}]",
+                format!("{control_ratio:.4}"),
+                (control_ratio * 1_000_000.0).round() as i64,
+                total_budget_khz,
+                self.util_max
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                util_cap_hit,
+                adjusted_target_fps
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                target_fps_offset
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                fps_short
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                fps_long
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                normalized_frame_ms
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                normalized_error_ms
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                normalized_error_ratio
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                normalized_error_ratio_smooth
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| "-".to_string()),
                 Self::format_policy_weights(weights),
                 Self::format_policy_freqs(&base_freqs),
                 Self::format_policy_freqs(&write_freqs)
@@ -212,32 +250,24 @@ impl Controller {
         }
     }
 
-    fn apply_policy_weights(
+    fn distribute_budget(
         &self,
-        freqs: HashMap<i32, isize>,
+        target_total_from_fas: f64,
         weights: Option<&HashMap<i32, f64>>,
     ) -> HashMap<i32, isize> {
-        let Some(weights) = weights else {
-            return freqs;
-        };
-        if freqs.is_empty() {
-            return freqs;
+        let mut out = HashMap::new();
+        if self.cpu_infos.is_empty() {
+            return out;
         }
 
-        let mut out = freqs.clone();
-        let mut policies = Vec::with_capacity(freqs.len());
-        let mut mins = Vec::with_capacity(freqs.len());
-        let mut caps = Vec::with_capacity(freqs.len());
-        let mut alloc = Vec::with_capacity(freqs.len());
-        let mut ws = Vec::with_capacity(freqs.len());
+        let mut policies = Vec::with_capacity(self.cpu_infos.len());
+        let mut mins = Vec::with_capacity(self.cpu_infos.len());
+        let mut maxs = Vec::with_capacity(self.cpu_infos.len());
+        let mut caps = Vec::with_capacity(self.cpu_infos.len());
+        let mut alloc = Vec::with_capacity(self.cpu_infos.len());
+        let mut ws = Vec::with_capacity(self.cpu_infos.len());
 
-        let mut total_budget = 0.0f64;
-        let mut total_weight = 0.0f64;
-
-        for (policy, base_freq) in &freqs {
-            let Some(info) = self.cpu_infos.iter().find(|cpu| cpu.policy == *policy) else {
-                continue;
-            };
+        for info in &self.cpu_infos {
             let Some(min_freq) = info.freqs.first().copied() else {
                 continue;
             };
@@ -245,25 +275,38 @@ impl Controller {
                 continue;
             };
 
-            let min_f = min_freq as f64;
-            let cap = max_freq.saturating_sub(min_freq).max(0) as f64;
-            let base_clamped = (*base_freq).clamp(min_freq, max_freq);
-            let base_budget = base_clamped.saturating_sub(min_freq).max(0) as f64;
-            let w = weights.get(policy).copied().unwrap_or(0.0).max(0.0);
-
-            policies.push(*policy);
-            mins.push(min_f);
-            caps.push(cap);
+            policies.push(info.policy);
+            mins.push(min_freq as f64);
+            maxs.push(max_freq as f64);
+            caps.push(max_freq.saturating_sub(min_freq).max(0) as f64);
             alloc.push(0.0);
-            ws.push(w);
-            total_budget += base_budget;
-            total_weight += w;
+            ws.push(
+                weights
+                    .and_then(|w| w.get(&info.policy).copied())
+                    .unwrap_or(1.0)
+                    .max(0.0),
+            );
         }
-        if policies.is_empty() || total_budget <= f64::EPSILON || total_weight <= f64::EPSILON {
+        if policies.is_empty() {
             return out;
         }
 
-        let mut remaining_budget = total_budget;
+        let total_min = mins.iter().sum::<f64>();
+        let total_max = maxs.iter().sum::<f64>();
+        let target_total = target_total_from_fas.clamp(total_min, total_max);
+        let mut remaining_budget = (target_total - total_min).max(0.0);
+        if remaining_budget <= f64::EPSILON {
+            for idx in 0..policies.len() {
+                out.insert(policies[idx], mins[idx].round() as isize);
+            }
+            return out;
+        }
+
+        let total_weight = ws.iter().sum::<f64>();
+        if total_weight <= f64::EPSILON {
+            ws.fill(1.0);
+        }
+
         let mut active: Vec<usize> = (0..policies.len()).collect();
 
         while remaining_budget > f64::EPSILON && !active.is_empty() {
@@ -342,55 +385,67 @@ impl Controller {
 
     fn compute_target_frequencies(
         &mut self,
-        control: isize,
+        control_ratio: f64,
         is_janked: bool,
-    ) -> HashMap<i32, isize> {
-        let cur_fas_freq_max = self
-            .cpu_infos
-            .iter()
-            .map(|cpu| cpu.cur_fas_freq)
-            .max()
-            .unwrap_or_default();
-        let cur_freq_max = self
-            .cpu_infos
-            .iter()
-            .map(cpu_info::Info::read_freq)
-            .max()
-            .unwrap_or_default();
+    ) -> (HashMap<i32, isize>, isize, bool) {
+        if self.cpu_infos.is_empty() {
+            return (HashMap::new(), 0, false);
+        }
 
-        if is_janked {
-            self.util_max = None;
-        } else {
+        if !is_janked {
             self.update_util_max();
         }
 
-        self.cpu_infos
-            .iter()
-            .map(|cpu| {
-                (
-                    cpu.policy,
-                    if is_janked || self.util_max.is_none() {
-                        cur_fas_freq_max
-                            .saturating_add(control)
-                            .clamp(0, self.max_freq)
-                    } else {
-                        let util_tracking_sugg_freq =
-                            (cur_freq_max as f64 * self.util_max.unwrap() / 0.5) as isize; // min_util: 50%
-                        #[cfg(debug_assertions)]
-                        debug!(
-                            "util: {}, cur_freq_max: {}, util_tracking_sugg_freq: {}",
-                            self.util_max.unwrap(),
-                            cur_freq_max,
-                            util_tracking_sugg_freq
-                        );
-                        cur_fas_freq_max
-                            .saturating_add(control)
-                            .min(util_tracking_sugg_freq)
-                            .clamp(0, self.max_freq)
-                    },
-                )
-            })
-            .collect()
+        let mut total_min = 0isize;
+        let mut total_max = 0isize;
+        let mut cur_total = 0isize;
+        for cpu in &self.cpu_infos {
+            if let Some(min_freq) = cpu.freqs.first().copied() {
+                total_min = total_min.saturating_add(min_freq);
+            }
+            if let Some(max_freq) = cpu.freqs.last().copied() {
+                total_max = total_max.saturating_add(max_freq);
+            }
+            cur_total = cur_total.saturating_add(cpu.read_freq());
+        }
+
+        let base_total = self
+            .total_budget_khz
+            .unwrap_or(cur_total)
+            .clamp(total_min, total_max);
+
+        let bounded_ratio = control_ratio.clamp(-0.8, 1.0);
+        let mut target_total = ((base_total as f64) * (1.0 + bounded_ratio)).round() as isize;
+        target_total = target_total.clamp(total_min, total_max);
+
+        let mut util_cap_hit = false;
+        // util guard: only apply an upper bound when under-utilized.
+        // If util < 50%, we consider additional boost wasteful and block further
+        // upward movement beyond current frequency.
+        if let Some(util_max) = self.util_max {
+            if util_max < 0.5 {
+                let util_cap = cur_total.clamp(total_min, total_max);
+                util_cap_hit = target_total > util_cap;
+                target_total = target_total.min(util_cap);
+            }
+        }
+
+        // Symmetric slew limiter on total budget.
+        if let Some(prev) = self.total_budget_khz {
+            const MAX_STEP_RATIO: f64 = 0.10;
+            const MIN_STEP_KHZ_PER_POLICY: isize = 30_000;
+            let policy_count = self.cpu_infos.len().max(1) as isize;
+            let min_step = MIN_STEP_KHZ_PER_POLICY.saturating_mul(policy_count);
+            let step = ((prev as f64) * MAX_STEP_RATIO).round() as isize;
+            let step = step.max(min_step);
+            let lo = prev.saturating_sub(step);
+            let hi = prev.saturating_add(step);
+            target_total = target_total.clamp(lo, hi).clamp(total_min, total_max);
+        }
+        self.total_budget_khz = Some(target_total);
+
+        let base_freqs = self.distribute_budget(target_total as f64, None);
+        (base_freqs, target_total, util_cap_hit)
     }
 
     fn sort_policies_topologically(&self) -> Vec<i32> {

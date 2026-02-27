@@ -21,7 +21,7 @@ use likely_stable::unlikely;
 #[cfg(debug_assertions)]
 use log::debug;
 
-use super::super::buffer::Buffer;
+use super::{super::buffer::Buffer, ControlOutput};
 use crate::framework::{config::MarginFps, prelude::*, scheduler::looper::ControllerState};
 
 pub fn calculate_control(
@@ -30,8 +30,7 @@ pub fn calculate_control(
     mode: Mode,
     controller_state: &mut ControllerState,
     target_fps_offset_thermal: f64,
-) -> Option<(isize, bool)> // control, is_janked
-{
+) -> Option<ControlOutput> {
     if unlikely(buffer.frametime_state.frametimes.len() < 60) {
         return None;
     }
@@ -59,10 +58,26 @@ pub fn calculate_control(
         debug!("target_frametime: {target_frametime:?}");
     }
 
-    Some((
-        calculate_control_inner(controller_state, adjusted_last_frame, target_frametime),
-        buffer.frametime_state.current_fps_long < target_fps - 2.0,
-    ))
+    let control_ratio =
+        calculate_control_inner(controller_state, adjusted_last_frame, target_frametime);
+    let normalized_frame_ms = adjusted_last_frame.as_secs_f64() * 1000.0;
+    let normalized_error_ms = normalized_frame_ms - target_frametime.as_secs_f64() * 1000.0;
+    let normalized_error_ratio = if target_frametime.is_zero() {
+        0.0
+    } else {
+        adjusted_last_frame.as_secs_f64() / target_frametime.as_secs_f64() - 1.0
+    };
+
+    Some(ControlOutput {
+        control_ratio,
+        is_janked: buffer.frametime_state.current_fps_long < target_fps - 2.0,
+        adjusted_target_fps,
+        target_fps_offset: controller_state.target_fps_offset,
+        normalized_frame_ms,
+        normalized_error_ms,
+        normalized_error_ratio,
+        normalized_error_ratio_smooth: controller_state.error_ratio_ema.unwrap_or(0.0),
+    })
 }
 
 fn get_normalized_last_frame(buffer: &Buffer, target_fps: f64) -> Duration {
@@ -72,11 +87,23 @@ fn get_normalized_last_frame(buffer: &Buffer, target_fps: f64) -> Duration {
         .front()
         .copied()
         .unwrap_or_default();
+    let short_avg_frame = buffer.frametime_state.avg_time_short;
+
+    // Symmetric blend between single-frame and short-window frame time.
+    // This keeps responsiveness while reducing one-frame catch-up noise.
+    const SHORT_AVG_BLEND: f64 = 0.30;
+    let beta = SHORT_AVG_BLEND.clamp(0.0, 1.0);
+    let representative = last_frame
+        .mul_f64(1.0 - beta)
+        .saturating_add(short_avg_frame.mul_f64(beta));
 
     if buffer.frametime_state.additional_frametime == Duration::ZERO {
-        last_frame
+        representative
     } else {
-        buffer.frametime_state.additional_frametime.max(last_frame)
+        buffer
+            .frametime_state
+            .additional_frametime
+            .max(representative)
     }
     .mul_f64(target_fps)
 }
@@ -95,20 +122,42 @@ fn adjust_target_fps(target_fps: f64, controller_state: &mut ControllerState) ->
         }
     }
 
-    controller_state.target_fps_offset = controller_state.target_fps_offset.clamp(-3.0, 0.0);
+    controller_state.target_fps_offset = controller_state.target_fps_offset.clamp(-1.0, 0.0);
     target_fps + controller_state.target_fps_offset
 }
 
 fn calculate_control_inner(
-    controller_state: &ControllerState,
+    controller_state: &mut ControllerState,
     current_frametime: Duration,
     target_frametime: Duration,
-) -> isize {
-    let error_p = (current_frametime.as_nanos() as f64 - target_frametime.as_nanos() as f64)
-        * controller_state.params.kp;
+) -> f64 {
+    let raw_error_ratio = if target_frametime.is_zero() {
+        0.0
+    } else {
+        current_frametime.as_secs_f64() / target_frametime.as_secs_f64() - 1.0
+    };
+
+    // Symmetric clip on raw error to prevent single outliers from polluting
+    // the EMA state.
+    let clip = controller_state.params.error_clip_ratio.max(0.01);
+    let clipped_raw_error_ratio = raw_error_ratio.clamp(-clip, clip);
+
+    // EMA filter suppresses one-frame noise before converting error into
+    // control action.
+    let alpha = controller_state.params.error_ema_alpha.clamp(0.0, 0.9999);
+    let smooth_error_ratio = if let Some(prev) = controller_state.error_ratio_ema {
+        alpha * prev + (1.0 - alpha) * clipped_raw_error_ratio
+    } else {
+        clipped_raw_error_ratio
+    };
+    controller_state.error_ratio_ema = Some(smooth_error_ratio);
+
+    let error_p = smooth_error_ratio * controller_state.params.kp;
 
     #[cfg(debug_assertions)]
-    debug!("error_p {error_p}");
+    debug!(
+        "error_p {error_p}, clipped_raw_error_ratio {clipped_raw_error_ratio}, smooth_error_ratio {smooth_error_ratio}"
+    );
 
-    error_p as isize
+    error_p
 }

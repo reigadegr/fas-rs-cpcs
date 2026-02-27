@@ -32,7 +32,7 @@ use likely_stable::{likely, unlikely};
 #[cfg(debug_assertions)]
 use log::debug;
 use log::{info, warn};
-use policy::{ControllerParams, controll::calculate_control};
+use policy::{ControlOutput, ControllerParams, controll::calculate_control};
 
 use super::{FasData, thermal::Thermal, topapp::TopAppsWatcher};
 use crate::{
@@ -80,6 +80,7 @@ struct ControllerState {
     params: ControllerParams,
     target_fps_offset: f64,
     usage_sample_timer: Instant,
+    error_ratio_ema: Option<f64>,
 }
 
 struct DiagState {
@@ -143,6 +144,7 @@ impl Looper {
                 params: ControllerParams::default(),
                 target_fps_offset: 0.0,
                 usage_sample_timer: Instant::now(),
+                error_ratio_ema: None,
             },
             diag_state: DiagState {
                 last_log: Instant::now(),
@@ -208,6 +210,7 @@ impl Looper {
                         self.fas_state.buffer.as_ref().unwrap().package_info.pid,
                         &self.extension,
                     );
+                    self.controller_state.error_ratio_ema = None;
                 }
             }
         }
@@ -276,7 +279,19 @@ impl Looper {
             return;
         }
 
-        let (pid, control, is_janked) = if let Some(buffer) = &self.fas_state.buffer {
+        let (
+            pid,
+            control_ratio,
+            is_janked,
+            adjusted_target_fps,
+            target_fps_offset,
+            fps_short,
+            fps_long,
+            norm_frame_ms,
+            norm_error_ms,
+            norm_error_ratio,
+            norm_error_ratio_smooth,
+        ) = if let Some(buffer) = &self.fas_state.buffer {
             let target_fps_offset = self
                 .therminal
                 .target_fps_offset(&mut self.config, self.fas_state.mode);
@@ -287,14 +302,35 @@ impl Looper {
                 &mut self.controller_state,
                 target_fps_offset,
             )
-            .unwrap_or_default();
-            (buffer.package_info.pid, result.0, result.1)
+            .unwrap_or(ControlOutput {
+                control_ratio: 0.0,
+                is_janked: false,
+                adjusted_target_fps: 0.0,
+                target_fps_offset: 0.0,
+                normalized_frame_ms: 1000.0,
+                normalized_error_ms: 0.0,
+                normalized_error_ratio: 0.0,
+                normalized_error_ratio_smooth: 0.0,
+            });
+            (
+                buffer.package_info.pid,
+                result.control_ratio,
+                result.is_janked,
+                Some(result.adjusted_target_fps),
+                Some(result.target_fps_offset),
+                Some(buffer.frametime_state.current_fps_short),
+                Some(buffer.frametime_state.current_fps_long),
+                Some(result.normalized_frame_ms),
+                Some(result.normalized_error_ms),
+                Some(result.normalized_error_ratio),
+                Some(result.normalized_error_ratio_smooth),
+            )
         } else {
             return;
         };
 
         #[cfg(debug_assertions)]
-        debug!("control: {control}khz");
+        debug!("control_ratio: {control_ratio:.4}");
 
         let weights = if CPCS_ENABLED {
             let weights = self
@@ -313,9 +349,19 @@ impl Looper {
             None
         };
 
-        self.controller_state
-            .controller
-            .fas_update_freq_weighted(control, is_janked, weights);
+        self.controller_state.controller.fas_update_freq_weighted(
+            control_ratio,
+            is_janked,
+            weights,
+            adjusted_target_fps,
+            target_fps_offset,
+            fps_short,
+            fps_long,
+            norm_frame_ms,
+            norm_error_ms,
+            norm_error_ratio,
+            norm_error_ratio_smooth,
+        );
         self.diag_state.policy_calls = self.diag_state.policy_calls.saturating_add(1);
     }
 
@@ -405,6 +451,7 @@ impl Looper {
                 self.controller_state
                     .controller
                     .init_default(&self.extension);
+                self.controller_state.error_ratio_ema = None;
                 trigger_stop_fas(&self.extension);
             }
             State::Waiting => self.fas_state.working_state = State::NotWorking,
@@ -424,6 +471,7 @@ impl Looper {
                     self.fas_state.working_state = State::Working;
                     self.cleaner.cleanup();
                     self.controller_state.target_fps_offset = 0.0;
+                    self.controller_state.error_ratio_ema = None;
                     self.controller_state.controller.init_game(
                         self.fas_state.buffer.as_ref().unwrap().package_info.pid,
                         &self.extension,
