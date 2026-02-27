@@ -152,27 +152,8 @@ impl Controller {
         control_ratio: f64,
         is_janked: bool,
         policy_weights: Option<&HashMap<i32, f64>>,
-        adjusted_target_fps: Option<f64>,
-        target_fps_offset: Option<f64>,
-        fps_short: Option<f64>,
-        fps_long: Option<f64>,
-        normalized_frame_ms: Option<f64>,
-        normalized_error_ms: Option<f64>,
-        normalized_error_ratio: Option<f64>,
-        normalized_error_ratio_smooth: Option<f64>,
     ) {
-        let _ = (
-            adjusted_target_fps,
-            target_fps_offset,
-            fps_short,
-            fps_long,
-            normalized_frame_ms,
-            normalized_error_ms,
-            normalized_error_ratio,
-            normalized_error_ratio_smooth,
-        );
-
-        let (base_freqs, total_budget_khz, util_cap_hit) =
+        let (base_freqs, total_budget_khz, _util_cap_hit) =
             self.compute_target_frequencies(control_ratio, is_janked);
         let weighted_freqs = if let Some(weights) = policy_weights {
             self.distribute_budget(total_budget_khz as f64, Some(weights))
@@ -210,13 +191,7 @@ impl Controller {
         } else {
             constrained_freqs.clone()
         };
-        let _ = (
-            control_ratio,
-            total_budget_khz,
-            util_cap_hit,
-            policy_weights,
-            base_freqs,
-        );
+        let _ = (control_ratio, total_budget_khz, policy_weights, base_freqs);
 
         for cpu in &mut self.cpu_infos {
             if let Some(freq) = write_freqs.get(&cpu.policy).copied() {

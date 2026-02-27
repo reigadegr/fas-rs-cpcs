@@ -51,23 +51,10 @@ pub fn calculate_control(
 
     let control_ratio =
         calculate_control_inner(controller_state, adjusted_last_frame, target_frametime);
-    let normalized_frame_ms = adjusted_last_frame.as_secs_f64() * 1000.0;
-    let normalized_error_ms = normalized_frame_ms - target_frametime.as_secs_f64() * 1000.0;
-    let normalized_error_ratio = if target_frametime.is_zero() {
-        0.0
-    } else {
-        adjusted_last_frame.as_secs_f64() / target_frametime.as_secs_f64() - 1.0
-    };
 
     Some(ControlOutput {
         control_ratio,
         is_janked: buffer.frametime_state.current_fps_long < target_fps - 2.0,
-        adjusted_target_fps,
-        target_fps_offset: controller_state.target_fps_offset,
-        normalized_frame_ms,
-        normalized_error_ms,
-        normalized_error_ratio,
-        normalized_error_ratio_smooth: controller_state.error_ratio_ema.unwrap_or(0.0),
     })
 }
 

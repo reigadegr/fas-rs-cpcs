@@ -19,9 +19,7 @@ mod buffer;
 mod clean;
 mod policy;
 
-use std::{
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use buffer::{Buffer, BufferWorkingState};
 use clean::Cleaner;
@@ -244,19 +242,7 @@ impl Looper {
             return;
         }
 
-        let (
-            pid,
-            control_ratio,
-            is_janked,
-            adjusted_target_fps,
-            target_fps_offset,
-            fps_short,
-            fps_long,
-            norm_frame_ms,
-            norm_error_ms,
-            norm_error_ratio,
-            norm_error_ratio_smooth,
-        ) = if let Some(buffer) = &self.fas_state.buffer {
+        let (pid, control_ratio, is_janked) = if let Some(buffer) = &self.fas_state.buffer {
             let target_fps_offset = self
                 .therminal
                 .target_fps_offset(&mut self.config, self.fas_state.mode);
@@ -270,25 +256,11 @@ impl Looper {
             .unwrap_or(ControlOutput {
                 control_ratio: 0.0,
                 is_janked: false,
-                adjusted_target_fps: 0.0,
-                target_fps_offset: 0.0,
-                normalized_frame_ms: 1000.0,
-                normalized_error_ms: 0.0,
-                normalized_error_ratio: 0.0,
-                normalized_error_ratio_smooth: 0.0,
             });
             (
                 buffer.package_info.pid,
                 result.control_ratio,
                 result.is_janked,
-                Some(result.adjusted_target_fps),
-                Some(result.target_fps_offset),
-                Some(buffer.frametime_state.current_fps_short),
-                Some(buffer.frametime_state.current_fps_long),
-                Some(result.normalized_frame_ms),
-                Some(result.normalized_error_ms),
-                Some(result.normalized_error_ratio),
-                Some(result.normalized_error_ratio_smooth),
             )
         } else {
             return;
@@ -304,14 +276,6 @@ impl Looper {
             control_ratio,
             is_janked,
             weights,
-            adjusted_target_fps,
-            target_fps_offset,
-            fps_short,
-            fps_long,
-            norm_frame_ms,
-            norm_error_ms,
-            norm_error_ratio,
-            norm_error_ratio_smooth,
         );
     }
 
