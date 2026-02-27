@@ -151,50 +151,20 @@ impl Controller {
         &mut self,
         control_ratio: f64,
         is_janked: bool,
-        policy_weights: Option<&HashMap<i32, f64>>,
+        policy_weights: &HashMap<i32, f64>,
     ) {
-        let (base_freqs, total_budget_khz, _util_cap_hit) =
+        let (total_budget_khz, _util_cap_hit) =
             self.compute_target_frequencies(control_ratio, is_janked);
-        let weighted_freqs = if let Some(weights) = policy_weights {
-            self.distribute_budget(total_budget_khz as f64, Some(weights))
-        } else {
-            base_freqs.clone()
-        };
+        let weighted_freqs = self.distribute_budget(total_budget_khz as f64, policy_weights);
         let sorted_policies = self.sort_policies_topologically();
         let constrained_freqs = Self::apply_relative_constraints(
             Self::apply_absolute_constraints(weighted_freqs, &sorted_policies),
             &sorted_policies,
         );
-
-        // Keep legacy no-extra-policy clamp for non-CPCS path.
-        // When CPCS weights are available, preserve inter-policy skew so
-        // critical-path weighting can take effect.
-        let write_freqs = if no_extra_policy() && policy_weights.is_none() {
-            let fas_freq_max = constrained_freqs
-                .values()
-                .max()
-                .copied()
-                .unwrap_or_default();
-            constrained_freqs
-                .iter()
-                .map(|(policy, freq)| {
-                    let freq = *freq;
-                    (
-                        *policy,
-                        freq.clamp(
-                            fas_freq_max.saturating_sub(100_000),
-                            fas_freq_max.saturating_add(100_000),
-                        ),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        } else {
-            constrained_freqs.clone()
-        };
-        let _ = (control_ratio, total_budget_khz, policy_weights, base_freqs);
+        let _ = (control_ratio, total_budget_khz, policy_weights);
 
         for cpu in &mut self.cpu_infos {
-            if let Some(freq) = write_freqs.get(&cpu.policy).copied() {
+            if let Some(freq) = constrained_freqs.get(&cpu.policy).copied() {
                 let _ = cpu.write_freq(freq, &mut self.file_handler);
             }
         }
@@ -203,7 +173,7 @@ impl Controller {
     fn distribute_budget(
         &self,
         target_total_from_fas: f64,
-        weights: Option<&HashMap<i32, f64>>,
+        weights: &HashMap<i32, f64>,
     ) -> HashMap<i32, isize> {
         let mut out = HashMap::new();
         if self.cpu_infos.is_empty() {
@@ -230,12 +200,7 @@ impl Controller {
             maxs.push(max_freq as f64);
             caps.push(max_freq.saturating_sub(min_freq).max(0) as f64);
             alloc.push(0.0);
-            ws.push(
-                weights
-                    .and_then(|w| w.get(&info.policy).copied())
-                    .unwrap_or(1.0)
-                    .max(0.0),
-            );
+            ws.push(weights.get(&info.policy).copied().unwrap_or(1.0).max(0.0));
         }
         if policies.is_empty() {
             return out;
@@ -309,13 +274,9 @@ impl Controller {
         }
     }
 
-    fn compute_target_frequencies(
-        &mut self,
-        control_ratio: f64,
-        is_janked: bool,
-    ) -> (HashMap<i32, isize>, isize, bool) {
+    fn compute_target_frequencies(&mut self, control_ratio: f64, is_janked: bool) -> (isize, bool) {
         if self.cpu_infos.is_empty() {
-            return (HashMap::new(), 0, false);
+            return (0, false);
         }
 
         if !is_janked {
@@ -370,8 +331,7 @@ impl Controller {
         }
         self.total_budget_khz = Some(target_total);
 
-        let base_freqs = self.distribute_budget(target_total as f64, None);
-        (base_freqs, target_total, util_cap_hit)
+        (target_total, util_cap_hit)
     }
 
     fn sort_policies_topologically(&self) -> Vec<i32> {
@@ -501,13 +461,4 @@ impl Controller {
     pub fn util_max(&self) -> f64 {
         self.util_max.unwrap_or_default()
     }
-}
-
-fn no_extra_policy() -> bool {
-    EXTRA_POLICY_MAP
-        .get()
-        .context("EXTRA_POLICY_MAP not initialized")
-        .unwrap()
-        .values()
-        .all(|policy| *policy.lock() == ExtraPolicy::None)
 }

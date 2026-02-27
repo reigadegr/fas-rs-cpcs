@@ -266,11 +266,14 @@ impl Looper {
             return;
         };
 
-        let weights = self
+        let Some(weights) = self
             .cpcs_state
             .analyzer
             .latest_for(pid)
-            .map(|weights| &weights.policy_weights);
+            .map(|weights| &weights.policy_weights)
+        else {
+            return;
+        };
 
         self.controller_state.controller.fas_update_freq_weighted(
             control_ratio,
