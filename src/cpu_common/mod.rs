@@ -33,7 +33,7 @@ use cpu_info::Info;
 use extra_policy::ExtraPolicy;
 #[cfg(debug_assertions)]
 use log::debug;
-use log::{info, warn};
+use log::warn;
 use parking_lot::Mutex;
 use process_monitor::ProcessMonitor;
 
@@ -161,8 +161,16 @@ impl Controller {
         normalized_error_ratio: Option<f64>,
         normalized_error_ratio_smooth: Option<f64>,
     ) {
-        #[cfg(debug_assertions)]
-        debug!("change ratio: {control_ratio}");
+        let _ = (
+            adjusted_target_fps,
+            target_fps_offset,
+            fps_short,
+            fps_long,
+            normalized_frame_ms,
+            normalized_error_ms,
+            normalized_error_ratio,
+            normalized_error_ratio_smooth,
+        );
 
         let (base_freqs, total_budget_khz, util_cap_hit) =
             self.compute_target_frequencies(control_ratio, is_janked);
@@ -202,46 +210,13 @@ impl Controller {
         } else {
             constrained_freqs.clone()
         };
-
-        if let Some(weights) = policy_weights {
-            info!(
-                "cpcs control_ratio={} control_ppm={} budget_khz={} util_max={} util_cap_hit={} adjusted_target_fps={} target_fps_offset={} fps_short={} fps_long={} norm_frame_ms={} norm_err_ms={} norm_err_ratio={} norm_err_ratio_smooth={} weights=[{}] base=[{}] final=[{}]",
-                format!("{control_ratio:.4}"),
-                (control_ratio * 1_000_000.0).round() as i64,
-                total_budget_khz,
-                self.util_max
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                util_cap_hit,
-                adjusted_target_fps
-                    .map(|v| format!("{v:.2}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                target_fps_offset
-                    .map(|v| format!("{v:.2}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                fps_short
-                    .map(|v| format!("{v:.1}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                fps_long
-                    .map(|v| format!("{v:.1}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                normalized_frame_ms
-                    .map(|v| format!("{v:.2}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                normalized_error_ms
-                    .map(|v| format!("{v:.2}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                normalized_error_ratio
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                normalized_error_ratio_smooth
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                Self::format_policy_weights(weights),
-                Self::format_policy_freqs(&base_freqs),
-                Self::format_policy_freqs(&write_freqs)
-            );
-        }
+        let _ = (
+            control_ratio,
+            total_budget_khz,
+            util_cap_hit,
+            policy_weights,
+            base_freqs,
+        );
 
         for cpu in &mut self.cpu_infos {
             if let Some(freq) = write_freqs.get(&cpu.policy).copied() {
@@ -351,30 +326,6 @@ impl Controller {
         }
 
         out
-    }
-
-    fn format_policy_freqs(freqs: &HashMap<i32, isize>) -> String {
-        let mut policies: Vec<_> = freqs.keys().copied().collect();
-        policies.sort_unstable();
-        policies
-            .into_iter()
-            .filter_map(|policy| freqs.get(&policy).map(|freq| format!("p{policy}={freq}")))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn format_policy_weights(weights: &HashMap<i32, f64>) -> String {
-        let mut policies: Vec<_> = weights.keys().copied().collect();
-        policies.sort_unstable();
-        policies
-            .into_iter()
-            .filter_map(|policy| {
-                weights
-                    .get(&policy)
-                    .map(|weight| format!("p{policy}={weight:.3}"))
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
     }
 
     fn update_util_max(&mut self) {

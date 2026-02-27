@@ -16,7 +16,7 @@ use aya::{
 };
 use cpcs_analyzer_common::{Event, EventKind};
 use ctor::ctor;
-use log::{info, warn};
+use log::warn;
 use mio::{Events, Interest, Poll, Token, event::Event as MioEvent, unix::SourceFd};
 
 pub type Pid = i32;
@@ -483,13 +483,7 @@ fn attach_frame_uprobe(bpf: &mut Ebpf, pid: i32, cfg: &AnalyzerConfig) -> Result
         }
 
         match program.attach(Some(symbol), 0, cfg.uprobe_lib.as_str(), Some(pid)) {
-            Ok(_) => {
-                info!(
-                    "cpcs attached frame_point: symbol={} lib={} pid={}",
-                    symbol, cfg.uprobe_lib, pid
-                );
-                return Ok(());
-            }
+            Ok(_) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
     }

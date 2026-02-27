@@ -18,8 +18,6 @@
 use std::time::{Duration, Instant};
 
 use likely_stable::unlikely;
-#[cfg(debug_assertions)]
-use log::debug;
 
 use super::{super::buffer::Buffer, ControlOutput};
 use crate::framework::{config::MarginFps, prelude::*, scheduler::looper::ControllerState};
@@ -50,13 +48,6 @@ pub fn calculate_control(
     let adjusted_target_fps = adjust_target_fps(target_fps, controller_state) - margin_fps;
     let adjusted_last_frame = get_normalized_last_frame(buffer, adjusted_target_fps);
     let target_frametime = Duration::from_secs(1);
-
-    #[cfg(debug_assertions)]
-    {
-        debug!("adjusted_target_fps: {adjusted_target_fps}");
-        debug!("adjusted_last_frame: {adjusted_last_frame:?}");
-        debug!("target_frametime: {target_frametime:?}");
-    }
 
     let control_ratio =
         calculate_control_inner(controller_state, adjusted_last_frame, target_frametime);
@@ -153,11 +144,6 @@ fn calculate_control_inner(
     controller_state.error_ratio_ema = Some(smooth_error_ratio);
 
     let error_p = smooth_error_ratio * controller_state.params.kp;
-
-    #[cfg(debug_assertions)]
-    debug!(
-        "error_p {error_p}, clipped_raw_error_ratio {clipped_raw_error_ratio}, smooth_error_ratio {smooth_error_ratio}"
-    );
 
     error_p
 }
