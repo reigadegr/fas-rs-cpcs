@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License along
 // with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use likely_stable::unlikely;
 
@@ -45,7 +45,8 @@ pub fn calculate_control(
     assert!(margin_fps.is_sign_positive(), "margin_fps must be positive");
 
     let target_fps = (target_fps + target_fps_offset_thermal).clamp(0.0, target_fps);
-    let adjusted_target_fps = adjust_target_fps(target_fps, controller_state) - margin_fps;
+    let adjusted_target_fps = target_fps - margin_fps;
+
     let adjusted_last_frame = get_normalized_last_frame(buffer, adjusted_target_fps);
     let target_frametime = Duration::from_secs(1);
 
@@ -84,24 +85,6 @@ fn get_normalized_last_frame(buffer: &Buffer, target_fps: f64) -> Duration {
             .max(representative)
     }
     .mul_f64(target_fps)
-}
-
-fn adjust_target_fps(target_fps: f64, controller_state: &mut ControllerState) -> f64 {
-    if controller_state.usage_sample_timer.elapsed() >= Duration::from_secs(1) {
-        controller_state.usage_sample_timer = Instant::now();
-        let util = controller_state.controller.util_max();
-
-        if util <= 0.1 {
-            controller_state.target_fps_offset = 0.0;
-        } else if util <= 0.55 {
-            controller_state.target_fps_offset -= 0.1;
-        } else if util >= 0.65 {
-            controller_state.target_fps_offset += 0.1;
-        }
-    }
-
-    controller_state.target_fps_offset = controller_state.target_fps_offset.clamp(-1.0, 0.0);
-    target_fps + controller_state.target_fps_offset
 }
 
 fn calculate_control_inner(

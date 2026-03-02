@@ -19,7 +19,15 @@ mod buffer;
 mod clean;
 mod policy;
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use buffer::{Buffer, BufferWorkingState};
 use clean::Cleaner;
@@ -45,6 +53,8 @@ use crate::{
 };
 
 const DELAY_TIME: Duration = Duration::from_secs(3);
+const CPCS_RECV_TIMEOUT: Duration = Duration::from_millis(20);
+const CPCS_STALE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(PartialEq, Debug)]
 enum State {
     NotWorking,
@@ -66,15 +76,25 @@ struct AnalyzerState {
 }
 
 struct CpcsState {
-    analyzer: CpcsAnalyzer,
+    cmd_tx: Sender<CpcsWorkerCmd>,
+    latest: Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
 }
 
 struct ControllerState {
     controller: Controller,
     params: ControllerParams,
-    target_fps_offset: f64,
-    usage_sample_timer: Instant,
     error_ratio_ema: Option<f64>,
+}
+
+#[derive(Clone)]
+struct TimedCpcsWeights {
+    received_at: Instant,
+    data: cpcs_analyzer::PolicyWeights,
+}
+
+enum CpcsWorkerCmd {
+    Attach(i32),
+    Detach(i32),
 }
 
 pub struct Looper {
@@ -88,6 +108,7 @@ pub struct Looper {
     cleaner: Cleaner,
     fas_state: FasState,
     controller_state: ControllerState,
+    cpcs_attached: HashSet<i32>,
 }
 
 impl Looper {
@@ -99,15 +120,14 @@ impl Looper {
         extension: Extension,
         controller: Controller,
     ) -> Self {
+        let cpcs_state = spawn_cpcs_worker(cpcs_analyzer);
         Self {
             analyzer_state: AnalyzerState {
                 analyzer,
                 restart_counter: 0,
                 restart_timer: Instant::now(),
             },
-            cpcs_state: CpcsState {
-                analyzer: cpcs_analyzer,
-            },
+            cpcs_state,
             config,
             node,
             extension,
@@ -123,20 +143,16 @@ impl Looper {
             controller_state: ControllerState {
                 controller,
                 params: ControllerParams::default(),
-                target_fps_offset: 0.0,
-                usage_sample_timer: Instant::now(),
                 error_ratio_ema: None,
             },
+            cpcs_attached: HashSet::new(),
         }
     }
 
     pub fn enter_loop(&mut self) -> Result<()> {
         loop {
             self.switch_mode();
-            if let Err(e) = self.update_analyzer() {
-                warn!("update analyzer failed: {e:#}");
-            }
-            self.refresh_cpcs_weights();
+            self.update_analyzer();
             self.retain_topapp();
 
             if self.windows_watcher.visible_freeform_window() {
@@ -192,34 +208,33 @@ impl Looper {
             .map(|(pid, frametime)| FasData { pid, frametime })
     }
 
-    fn update_analyzer(&mut self) -> Result<()> {
+    fn update_analyzer(&mut self) {
         for pid in self.windows_watcher.topapp_pids().iter().copied() {
-            let pkg = get_process_name(pid)?;
-            if self.config.need_fas(&pkg) {
-                self.analyzer_state.analyzer.attach_app(pid)?;
-                self.cpcs_state.analyzer.attach_app(pid)?;
+            let Ok(pkg) = get_process_name(pid) else {
+                continue;
+            };
+
+            if !self.config.need_fas(&pkg) {
+                continue;
+            }
+
+            let _ = self.analyzer_state.analyzer.attach_app(pid);
+            if self.cpcs_attached.insert(pid)
+                && self.cpcs_state.cmd_tx.send(CpcsWorkerCmd::Attach(pid)).is_err()
+            {
+                self.cpcs_attached.remove(&pid);
             }
         }
-        Ok(())
     }
 
-    fn refresh_cpcs_weights(&mut self) -> usize {
-        let mut updates = 0usize;
-        loop {
-            match self
-                .cpcs_state
-                .analyzer
-                .recv_timeout(Duration::from_millis(0))
-            {
-                Ok(_) => updates = updates.saturating_add(1),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    warn!("cpcs analyzer disconnected");
-                    break;
-                }
-            }
+    fn cpcs_weights_for(&mut self, pid: i32) -> Option<cpcs_analyzer::PolicyWeights> {
+        let now = Instant::now();
+        let latest = self.cpcs_state.latest.lock().ok()?;
+        let item = latest.get(&pid)?;
+        if now.duration_since(item.received_at) > CPCS_STALE_TIMEOUT {
+            return None;
         }
-        updates
+        Some(item.data.clone())
     }
 
     fn restart_analyzer(&mut self) {
@@ -228,7 +243,7 @@ impl Looper {
                 self.analyzer_state.restart_timer = Instant::now();
                 self.analyzer_state.restart_counter = 0;
                 self.analyzer_state.analyzer.detach_apps();
-                let _ = self.update_analyzer();
+                self.update_analyzer();
             }
         } else {
             self.analyzer_state.restart_counter += 1;
@@ -237,43 +252,34 @@ impl Looper {
 
     fn do_policy(&mut self) {
         if unlikely(self.fas_state.working_state != State::Working) {
-            #[cfg(debug_assertions)]
-            debug!("Not running policy!");
             return;
         }
 
-        let (pid, control_ratio, is_janked) = if let Some(buffer) = &self.fas_state.buffer {
-            let target_fps_offset = self
-                .therminal
-                .target_fps_offset(&mut self.config, self.fas_state.mode);
-            let result = calculate_control(
-                buffer,
-                &mut self.config,
-                self.fas_state.mode,
-                &mut self.controller_state,
-                target_fps_offset,
-            )
-            .unwrap_or(ControlOutput {
-                control_ratio: 0.0,
-                is_janked: false,
-            });
-            (
-                buffer.package_info.pid,
-                result.control_ratio,
-                result.is_janked,
-            )
-        } else {
-            return;
-        };
+        let (pid, control_ratio, is_janked) =
+            if let Some(buffer) = &self.fas_state.buffer {
+                let target_fps_offset = self
+                    .therminal
+                    .target_fps_offset(&mut self.config, self.fas_state.mode);
+                let result = calculate_control(
+                    buffer,
+                    &mut self.config,
+                    self.fas_state.mode,
+                    &mut self.controller_state,
+                    target_fps_offset,
+                )
+                .unwrap_or(ControlOutput {
+                    control_ratio: 0.0,
+                    is_janked: false,
+                });
+                (buffer.package_info.pid, result.control_ratio, result.is_janked)
+            } else {
+                return;
+            };
 
-        let Some(weights) = self
-            .cpcs_state
-            .analyzer
-            .latest_for(pid)
-            .map(|weights| &weights.policy_weights)
-        else {
+        let Some(cpcs) = self.cpcs_weights_for(pid) else {
             return;
         };
+        let weights = &cpcs.policy_weights;
 
         self.controller_state.controller.fas_update_freq_weighted(
             control_ratio,
@@ -293,7 +299,12 @@ impl Looper {
                     .analyzer_state
                     .analyzer
                     .detach_app(buffer.package_info.pid);
-                let _ = self.cpcs_state.analyzer.detach_app(buffer.package_info.pid);
+                if self.cpcs_attached.remove(&buffer.package_info.pid) {
+                    let _ = self
+                        .cpcs_state
+                        .cmd_tx
+                        .send(CpcsWorkerCmd::Detach(buffer.package_info.pid));
+                }
                 let pkg = buffer.package_info.pkg.clone();
                 trigger_unload_fas(&self.extension, buffer.package_info.pid, pkg);
                 self.fas_state.buffer = None;
@@ -301,6 +312,15 @@ impl Looper {
         }
 
         if self.fas_state.buffer.is_none() {
+            self.disable_fas();
+        } else if self
+            .fas_state
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.state.working_state == BufferWorkingState::Unusable)
+        {
+            // Keep FAS disabled while the frame buffer is still warming up or
+            // temporarily invalid. This avoids NotWorking<->Waiting thrash.
             self.disable_fas();
         } else {
             self.enable_fas();
@@ -334,7 +354,6 @@ impl Looper {
                 if self.fas_state.delay_timer.elapsed() > DELAY_TIME {
                     self.fas_state.working_state = State::Working;
                     self.cleaner.cleanup();
-                    self.controller_state.target_fps_offset = 0.0;
                     self.controller_state.error_ratio_ema = None;
                     self.controller_state.controller.init_game(
                         self.fas_state.buffer.as_ref().unwrap().package_info.pid,
@@ -375,6 +394,92 @@ impl Looper {
             self.fas_state.buffer = Some(buffer);
 
             Some(BufferWorkingState::Unusable)
+        }
+    }
+}
+
+fn spawn_cpcs_worker(analyzer: CpcsAnalyzer) -> CpcsState {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let latest = Arc::new(Mutex::new(HashMap::new()));
+    let latest_worker = Arc::clone(&latest);
+
+    thread::Builder::new()
+        .name("cpcs".to_string())
+        .spawn(move || cpcs_worker_loop(analyzer, cmd_rx, latest_worker))
+        .expect("failed to spawn cpcs worker");
+
+    CpcsState { cmd_tx, latest }
+}
+
+fn cpcs_worker_loop(
+    mut analyzer: CpcsAnalyzer,
+    cmd_rx: Receiver<CpcsWorkerCmd>,
+    latest: Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
+) {
+    let mut attached = HashSet::new();
+
+    loop {
+        // When no app is attached, block for commands and avoid spinning.
+        if attached.is_empty() {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    handle_cpcs_cmd(&mut analyzer, &latest, &mut attached, cmd);
+                    continue;
+                }
+                Err(_) => return,
+            }
+        }
+
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => handle_cpcs_cmd(&mut analyzer, &latest, &mut attached, cmd),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        match analyzer.recv_timeout(CPCS_RECV_TIMEOUT) {
+            Ok((pid, weights)) => {
+                if let Ok(mut guard) = latest.lock() {
+                    guard.insert(
+                        pid,
+                        TimedCpcsWeights {
+                            received_at: Instant::now(),
+                            data: weights,
+                        },
+                    );
+                    guard.retain(|_, item| item.received_at.elapsed() <= CPCS_STALE_TIMEOUT);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                warn!("cpcs worker recv disconnected");
+                return;
+            }
+        }
+    }
+}
+
+fn handle_cpcs_cmd(
+    analyzer: &mut CpcsAnalyzer,
+    latest: &Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
+    attached: &mut HashSet<i32>,
+    cmd: CpcsWorkerCmd,
+) {
+    match cmd {
+        CpcsWorkerCmd::Attach(pid) => {
+            if attached.insert(pid) && let Err(e) = analyzer.attach_app(pid) {
+                warn!("cpcs worker attach failed pid={pid}: {e:#}");
+                attached.remove(&pid);
+            }
+        }
+        CpcsWorkerCmd::Detach(pid) => {
+            if attached.remove(&pid) && let Err(e) = analyzer.detach_app(pid) {
+                warn!("cpcs worker detach failed pid={pid}: {e:#}");
+            }
+            if let Ok(mut guard) = latest.lock() {
+                guard.remove(&pid);
+            }
         }
     }
 }
