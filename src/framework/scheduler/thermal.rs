@@ -15,7 +15,11 @@
 // You should have received a copy of the GNU General Public License along
 // with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 #[cfg(debug_assertions)]
@@ -27,7 +31,10 @@ pub struct Thermal {
     target_fps_offset: f64,
     core_temperature: u64,
     nodes: Vec<PathBuf>,
+    last_temp_update: Instant,
 }
+
+const TEMP_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl Thermal {
     pub fn new() -> Result<Self> {
@@ -50,6 +57,7 @@ impl Thermal {
             target_fps_offset: 0.0,
             core_temperature: 0,
             nodes,
+            last_temp_update: Instant::now() - TEMP_UPDATE_INTERVAL,
         })
     }
 
@@ -59,7 +67,10 @@ impl Thermal {
             TemperatureThreshold::Temp(t) => t,
         };
 
-        self.temperature_update();
+        if self.last_temp_update.elapsed() >= TEMP_UPDATE_INTERVAL {
+            self.temperature_update();
+            self.last_temp_update = Instant::now();
+        }
 
         #[cfg(debug_assertions)]
         {

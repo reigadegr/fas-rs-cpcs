@@ -34,6 +34,7 @@ pub struct Info {
     path: PathBuf,
     pub cur_fas_freq: isize,
     pub freqs: Vec<isize>,
+    last_written_freq: Option<isize>,
     verify_freq: Option<isize>,
     verify_timer: Instant,
 }
@@ -63,9 +64,25 @@ impl Info {
             path,
             cur_fas_freq: *freqs.last().context("No frequencies available")?,
             freqs,
+            last_written_freq: None,
             verify_freq: None,
             verify_timer: Instant::now(),
         })
+    }
+
+    fn snap_to_available_freq(&self, freq: isize) -> isize {
+        let mut best = *self.freqs.first().unwrap_or(&freq);
+        let mut best_diff = (best as i64 - freq as i64).abs();
+
+        for &candidate in self.freqs.iter().skip(1) {
+            let diff = (candidate as i64 - freq as i64).abs();
+            if diff < best_diff || (diff == best_diff && candidate < best) {
+                best = candidate;
+                best_diff = diff;
+            }
+        }
+
+        best
     }
 
     fn verify_freq(&mut self, write_freq: isize) {
@@ -112,15 +129,21 @@ impl Info {
         let min_freq = *self.freqs.first().context("No frequencies available")?;
         let max_freq = *self.freqs.last().context("No frequencies available")?;
 
-        let adjusted_freq = freq.clamp(min_freq, max_freq);
-        self.cur_fas_freq = adjusted_freq;
+        let target_freq = freq.clamp(min_freq, max_freq);
+        self.cur_fas_freq = target_freq;
+        let write_freq = self.snap_to_available_freq(target_freq);
+
+        if self.last_written_freq == Some(write_freq) {
+            return Ok(());
+        }
 
         if !self.ignore_write()? {
-            self.verify_freq(adjusted_freq);
-            let adjusted_freq = adjusted_freq.to_string();
-            file_handler.write_with_workround(self.max_freq_path(), &adjusted_freq)?;
-            file_handler.write_with_workround(self.min_freq_path(), &adjusted_freq)?;
+            self.verify_freq(write_freq);
+            let write_freq = write_freq.to_string();
+            file_handler.write_with_workround(self.max_freq_path(), &write_freq)?;
+            file_handler.write_with_workround(self.min_freq_path(), &write_freq)?;
         }
+        self.last_written_freq = Some(write_freq);
 
         Ok(())
     }
@@ -136,11 +159,20 @@ impl Info {
             .last()
             .context("No frequencies available")?
             .to_string();
+        self.last_written_freq = None;
         self.verify_freq = None;
 
         file_handler.write_with_workround(self.max_freq_path(), &max_freq)?;
         file_handler.write_with_workround(self.min_freq_path(), &min_freq)?;
         Ok(())
+    }
+
+    pub fn sync_from_hw_freq(&mut self, hw_freq: isize) {
+        let min_freq = self.freqs.first().copied().unwrap_or(hw_freq);
+        let max_freq = self.freqs.last().copied().unwrap_or(hw_freq);
+        let clamped = hw_freq.clamp(min_freq, max_freq);
+        self.cur_fas_freq = clamped;
+        self.last_written_freq = Some(self.snap_to_available_freq(clamped));
     }
 
     pub fn read_freq(&self) -> isize {

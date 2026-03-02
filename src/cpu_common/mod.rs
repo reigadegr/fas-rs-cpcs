@@ -16,8 +16,8 @@
 // with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 
 mod cpu_info;
+mod cpu_usage_monitor;
 pub mod extra_policy;
-mod process_monitor;
 
 use std::{
     collections::HashMap,
@@ -35,7 +35,7 @@ use extra_policy::ExtraPolicy;
 use log::debug;
 use log::warn;
 use parking_lot::Mutex;
-use process_monitor::ProcessMonitor;
+use cpu_usage_monitor::CpuUsageMonitor;
 
 use crate::{
     Extension,
@@ -50,12 +50,15 @@ pub static IGNORE_MAP: OnceLock<HashMap<i32, AtomicBool>> = OnceLock::new();
 pub struct Controller {
     cpu_infos: Vec<Info>,
     file_handler: FileHandler,
-    process_monitor: ProcessMonitor,
-    util_max: Option<f64>,
+    usage_monitor: CpuUsageMonitor,
+    util_cpu0: Option<f64>,
     total_budget_khz: Option<isize>,
 }
 
 impl Controller {
+    const P0_POLICY: i32 = 0;
+    const CPU0_UTIL_TARGET: f64 = 0.95;
+
     pub fn new() -> Result<Self> {
         let mut cpu_infos = Self::load_cpu_infos()?;
         cpu_infos.sort_by_key(|cpu| cpu.policy);
@@ -79,8 +82,8 @@ impl Controller {
         Ok(Self {
             cpu_infos,
             file_handler: FileHandler::new(),
-            process_monitor: ProcessMonitor::new(),
-            util_max: None,
+            usage_monitor: CpuUsageMonitor::new(),
+            util_cpu0: None,
             total_budget_khz: None,
         })
     }
@@ -131,19 +134,19 @@ impl Controller {
         }
     }
 
-    pub fn init_game(&mut self, pid: i32, extension: &Extension) {
+    pub fn init_game(&mut self, _pid: i32, extension: &Extension) {
         trigger_init_cpu_freq(extension);
         self.reset_all_cpu_freq();
-        self.process_monitor.set_pid(Some(pid));
-        self.util_max = None;
+        self.sync_cur_freq_from_hw();
+        self.util_cpu0 = None;
         self.total_budget_khz = None;
     }
 
     pub fn init_default(&mut self, extension: &Extension) {
         trigger_reset_cpu_freq(extension);
         self.reset_all_cpu_freq();
-        self.process_monitor.set_pid(None);
-        self.util_max = None;
+        self.sync_cur_freq_from_hw();
+        self.util_cpu0 = None;
         self.total_budget_khz = None;
     }
 
@@ -153,15 +156,15 @@ impl Controller {
         is_janked: bool,
         policy_weights: &HashMap<i32, f64>,
     ) {
-        let (total_budget_khz, _util_cap_hit) =
-            self.compute_target_frequencies(control_ratio, is_janked);
+        let total_budget_khz = self.compute_target_frequencies(control_ratio, is_janked);
         let weighted_freqs = self.distribute_budget(total_budget_khz as f64, policy_weights);
+
         let sorted_policies = self.sort_policies_topologically();
-        let constrained_freqs = Self::apply_relative_constraints(
+        let mut constrained_freqs = Self::apply_relative_constraints(
             Self::apply_absolute_constraints(weighted_freqs, &sorted_policies),
             &sorted_policies,
         );
-        let _ = (control_ratio, total_budget_khz, policy_weights);
+        self.apply_p0_util_guard(&mut constrained_freqs);
 
         for cpu in &mut self.cpu_infos {
             if let Some(freq) = constrained_freqs.get(&cpu.policy).copied() {
@@ -268,19 +271,64 @@ impl Controller {
         out
     }
 
-    fn update_util_max(&mut self) {
-        if let Some(util_max) = self.process_monitor.update() {
-            self.util_max = Some(util_max);
+    fn update_cpu0_util(&mut self) {
+        if let Some(snapshot) = self.usage_monitor.update() {
+            self.util_cpu0 = Some(snapshot.cpu0_util);
         }
     }
 
-    fn compute_target_frequencies(&mut self, control_ratio: f64, is_janked: bool) -> (isize, bool) {
+    fn sync_cur_freq_from_hw(&mut self) {
+        for cpu in &mut self.cpu_infos {
+            let Some(min_freq) = cpu.freqs.first().copied() else {
+                continue;
+            };
+            let Some(max_freq) = cpu.freqs.last().copied() else {
+                continue;
+            };
+            let hw_freq = cpu.read_freq().clamp(min_freq, max_freq);
+            cpu.sync_from_hw_freq(hw_freq);
+        }
+    }
+
+    fn compute_p0_guard_freq_khz(&self) -> Option<isize> {
+        let cpu0_util = self.util_cpu0?;
+        if cpu0_util <= Self::CPU0_UTIL_TARGET {
+            return None;
+        }
+        let p0_info = self
+            .cpu_infos
+            .iter()
+            .find(|info| info.policy == Self::P0_POLICY)?;
+        let min = *p0_info.freqs.first()?;
+        let max = *p0_info.freqs.last()?;
+        let current = p0_info.cur_fas_freq.clamp(min, max);
+        let guarded = ((current as f64) * (cpu0_util / Self::CPU0_UTIL_TARGET)).round() as isize;
+        Some(guarded.clamp(min, max))
+    }
+
+    fn apply_p0_util_guard(&self, freqs: &mut HashMap<i32, isize>) -> bool {
+        let Some(p0_guard) = self.compute_p0_guard_freq_khz() else {
+            return false;
+        };
+        if let Some(p0_target) = freqs.get_mut(&Self::P0_POLICY) {
+            let hit = *p0_target < p0_guard;
+            *p0_target = (*p0_target).max(p0_guard);
+            return hit;
+        }
+        false
+    }
+
+    fn compute_target_frequencies(
+        &mut self,
+        control_ratio: f64,
+        is_janked: bool,
+    ) -> isize {
         if self.cpu_infos.is_empty() {
-            return (0, false);
+            return 0;
         }
 
         if !is_janked {
-            self.update_util_max();
+            self.update_cpu0_util();
         }
 
         let mut total_min = 0isize;
@@ -293,7 +341,11 @@ impl Controller {
             if let Some(max_freq) = cpu.freqs.last().copied() {
                 total_max = total_max.saturating_add(max_freq);
             }
-            cur_total = cur_total.saturating_add(cpu.read_freq());
+            let cur = cpu.cur_fas_freq.clamp(
+                cpu.freqs.first().copied().unwrap_or(cpu.cur_fas_freq),
+                cpu.freqs.last().copied().unwrap_or(cpu.cur_fas_freq),
+            );
+            cur_total = cur_total.saturating_add(cur);
         }
 
         let base_total = self
@@ -304,18 +356,6 @@ impl Controller {
         let bounded_ratio = control_ratio.clamp(-0.8, 1.0);
         let mut target_total = ((base_total as f64) * (1.0 + bounded_ratio)).round() as isize;
         target_total = target_total.clamp(total_min, total_max);
-
-        let mut util_cap_hit = false;
-        // util guard: only apply an upper bound when under-utilized.
-        // If util < 50%, we consider additional boost wasteful and block further
-        // upward movement beyond current frequency.
-        if let Some(util_max) = self.util_max {
-            if util_max < 0.5 {
-                let util_cap = cur_total.clamp(total_min, total_max);
-                util_cap_hit = target_total > util_cap;
-                target_total = target_total.min(util_cap);
-            }
-        }
 
         // Symmetric slew limiter on total budget.
         if let Some(prev) = self.total_budget_khz {
@@ -330,8 +370,7 @@ impl Controller {
             target_total = target_total.clamp(lo, hi).clamp(total_min, total_max);
         }
         self.total_budget_khz = Some(target_total);
-
-        (target_total, util_cap_hit)
+        target_total
     }
 
     fn sort_policies_topologically(&self) -> Vec<i32> {
@@ -456,9 +495,5 @@ impl Controller {
         for cpu in &mut self.cpu_infos {
             let _ = cpu.reset(&mut self.file_handler);
         }
-    }
-
-    pub fn util_max(&self) -> f64 {
-        self.util_max.unwrap_or_default()
     }
 }
