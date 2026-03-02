@@ -7,12 +7,17 @@ use aya_ebpf::{
     maps::{Array, HashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
 };
-use cpcs_analyzer_common::{Event, EventKind};
+use cpcs_analyzer_common::{DagThreadMetrics, Event, EventKind};
 
 const MAX_CPUS: u32 = 32;
+const DAG_BANKS: u32 = 8;
+const FRAME_SAMPLE_EVERY: u64 = 4;
 const DAG_EDGE_MAX: u32 = 65536;
 const DAG_THREAD_MAX: u32 = 32768;
 const INVALID_POLICY: u32 = u32::MAX;
+const EXEC_MIN_NS: u64 = 30_000;
+const RQ_MIN_NS: u64 = 20_000;
+const FUTEX_MIN_NS: u64 = 100_000;
 
 #[map]
 static FRAME_RING: RingBuf = RingBuf::with_byte_size(0x4000, 0);
@@ -27,10 +32,16 @@ static TARGET_TIDS: HashMap<u32, u8> = HashMap::with_max_entries(32768, 0);
 static DAG_ACTIVE_BANK: Array<u32> = Array::with_max_entries(1, 0);
 
 #[map]
+static BANK_FRAME_ID: Array<u64> = Array::with_max_entries(DAG_BANKS, 0);
+
+#[map]
 static CPU_TO_POLICY: Array<u32> = Array::with_max_entries(MAX_CPUS, 0);
 
 #[map]
 static FRAME_ID: Array<u64> = Array::with_max_entries(1, 0);
+
+#[map]
+static SAMPLE_ACTIVE: Array<u32> = Array::with_max_entries(1, 0);
 
 #[map]
 static RUNNING_TID: Array<u32> = Array::with_max_entries(MAX_CPUS, 0);
@@ -43,28 +54,52 @@ static RUNNING_START_NS: Array<u64> = Array::with_max_entries(MAX_CPUS, 0);
 struct DagWakeInfo {
     ktime_ns: u64,
     waker_tid: u32,
-    _pad: u32,
+    sampled: u32,
 }
 
 #[map]
 static DAG_LAST_WAKEUP: HashMap<u32, DagWakeInfo> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 
 #[map]
-static DAG_THREAD_POLICY_EXEC_0: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_0: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
-static DAG_THREAD_POLICY_EXEC_1: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_1: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
-static DAG_THREAD_POLICY_RQ_0: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_2: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
-static DAG_THREAD_POLICY_RQ_1: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_3: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
-static DAG_THREAD_POLICY_FUTEX_0: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_4: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
-static DAG_THREAD_POLICY_FUTEX_1: HashMap<u64, u64> = HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+static DAG_THREAD_POLICY_STATS_5: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+#[map]
+static DAG_THREAD_POLICY_STATS_6: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
+#[map]
+static DAG_THREAD_POLICY_STATS_7: HashMap<u64, DagThreadMetrics> =
+    HashMap::with_max_entries(DAG_THREAD_MAX, 0);
 #[map]
 static DAG_EDGE_0: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
 #[map]
 static DAG_EDGE_1: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_2: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_3: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_4: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_5: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_6: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
+#[map]
+static DAG_EDGE_7: HashMap<u64, u64> = HashMap::with_max_entries(DAG_EDGE_MAX, 0);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -72,7 +107,7 @@ struct PendingWait {
     start_ns: u64,
     uaddr: u64,
     cpu: u32,
-    _pad: u32,
+    sampled: u32,
 }
 
 #[map]
@@ -84,6 +119,7 @@ struct WakeByAddr {
     ktime_ns: u64,
     cpu: u32,
     waker_tid: u32,
+    sampled: u32,
 }
 
 #[map]
@@ -109,12 +145,39 @@ fn emit_event(_ctx: ProbeContext) -> Result<u32, u32> {
 
     let closed_bank = dag_active_bank();
     if prev_frame > 0 {
-        split_running_exec_dag(now, closed_bank);
+        let sample_prev = should_sample_frame(prev_frame);
+        split_running_exec_dag(now, closed_bank, sample_prev);
+        if sample_prev {
+            set_bank_frame_id(closed_bank, prev_frame);
+            set_dag_active_bank((closed_bank + 1) % DAG_BANKS);
+            emit_simple_event(EventKind::FramePoint, next_frame, closed_bank as u64, 0);
+        }
     }
-    set_dag_active_bank(closed_bank ^ 1);
+    set_sample_active(should_sample_frame(next_frame));
 
-    emit_simple_event(EventKind::FramePoint, next_frame, closed_bank as u64, 0);
     Ok(0)
+}
+
+fn should_sample_frame(frame_id: u64) -> bool {
+    if frame_id == 0 {
+        return false;
+    }
+    if FRAME_SAMPLE_EVERY <= 1 {
+        return true;
+    }
+    frame_id.wrapping_add(1) % FRAME_SAMPLE_EVERY == 0
+}
+
+fn sampling_enabled() -> bool {
+    SAMPLE_ACTIVE.get(0).copied().unwrap_or(0) != 0
+}
+
+fn set_sample_active(enabled: bool) {
+    if let Some(ptr) = SAMPLE_ACTIVE.get_ptr_mut(0) {
+        unsafe {
+            *ptr = if enabled { 1 } else { 0 };
+        }
+    }
 }
 
 #[repr(C)]
@@ -166,13 +229,16 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let now = unsafe { bpf_ktime_get_ns() };
     let cpu = unsafe { bpf_get_smp_processor_id() } as u32;
     let bank = dag_active_bank();
+    let sample = sampling_enabled();
 
     if is_target_tid(prev_tid) && valid_cpu(cpu) {
         let running_tid = RUNNING_TID.get(cpu).copied().unwrap_or(0);
         if running_tid == prev_tid {
             let start_ns = RUNNING_START_NS.get(cpu).copied().unwrap_or(0);
             if start_ns > 0 && now > start_ns {
-                dag_add_thread_exec(bank, prev_tid, cpu, now - start_ns);
+                if sample {
+                    dag_add_thread_exec(bank, prev_tid, cpu, now - start_ns);
+                }
             }
         }
         set_array_u32(&RUNNING_TID, cpu, 0);
@@ -184,8 +250,10 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
             let wake = unsafe { *wake_ptr };
             if now > wake.ktime_ns {
                 let delay = now - wake.ktime_ns;
-                dag_add_thread_rq(bank, next_tid, cpu, delay);
-                dag_add_edge(bank, wake.waker_tid, next_tid, delay);
+                if sample && wake.sampled != 0 {
+                    dag_add_thread_rq(bank, next_tid, cpu, delay);
+                    dag_add_edge(bank, wake.waker_tid, next_tid, delay);
+                }
             }
             let _ = DAG_LAST_WAKEUP.remove(&next_tid);
         }
@@ -216,7 +284,7 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
         let wake = DagWakeInfo {
             ktime_ns: unsafe { bpf_ktime_get_ns() },
             waker_tid,
-            _pad: 0,
+            sampled: if sampling_enabled() { 1 } else { 0 },
         };
         let _ = DAG_LAST_WAKEUP.insert(&wakee_tid, &wake, 0);
     }
@@ -346,7 +414,7 @@ fn handle_futex_enter_dag(uaddr: u64, op: u32, _val: u64) {
             start_ns: unsafe { bpf_ktime_get_ns() },
             uaddr,
             cpu: unsafe { bpf_get_smp_processor_id() } as u32,
-            _pad: 0,
+            sampled: if sampling_enabled() { 1 } else { 0 },
         };
         let tid = current_tid();
         let _ = PENDING_WAIT.insert(&tid, &pending, 0);
@@ -355,6 +423,7 @@ fn handle_futex_enter_dag(uaddr: u64, op: u32, _val: u64) {
             ktime_ns: unsafe { bpf_ktime_get_ns() },
             cpu: unsafe { bpf_get_smp_processor_id() } as u32,
             waker_tid: current_tid(),
+            sampled: if sampling_enabled() { 1 } else { 0 },
         };
         let _ = WAKE_BY_ADDR.insert(&uaddr, &wake, 0);
     }
@@ -375,32 +444,36 @@ fn handle_futex_exit_dag(_ret: u64) {
 
     let wait_ns = now - pending.start_ns;
     let bank = dag_active_bank();
+    let sample = sampling_enabled() && pending.sampled != 0;
+
+    let wake = WAKE_BY_ADDR
+        .get_ptr(&pending.uaddr)
+        .map(|wake_ptr| unsafe { *wake_ptr });
 
     let mut attr_cpu = pending.cpu;
-    if let Some(wake_ptr) = WAKE_BY_ADDR.get_ptr(&pending.uaddr) {
-        let wake = unsafe { *wake_ptr };
+    if let Some(wake) = wake {
         if wake.ktime_ns >= pending.start_ns && wake.ktime_ns <= now {
             attr_cpu = wake.cpu;
+            if sample && wake.sampled != 0 {
+                dag_add_edge(bank, wake.waker_tid, tid, wait_ns);
+            }
         }
     }
-    dag_add_thread_futex(bank, tid, attr_cpu, wait_ns);
-
-    if let Some(wake_ptr) = WAKE_BY_ADDR.get_ptr(&pending.uaddr) {
-        let wake = unsafe { *wake_ptr };
-        if wake.ktime_ns >= pending.start_ns && wake.ktime_ns <= now {
-            dag_add_edge(bank, wake.waker_tid, tid, wait_ns);
-        }
+    if sample {
+        dag_add_thread_futex(bank, tid, attr_cpu, wait_ns);
     }
 }
 
-fn split_running_exec_dag(now: u64, bank: u32) {
+fn split_running_exec_dag(now: u64, bank: u32, sample: bool) {
     let mut cpu = 0u32;
     while cpu < MAX_CPUS {
         let tid = RUNNING_TID.get(cpu).copied().unwrap_or(0);
         if tid != 0 {
             let start_ns = RUNNING_START_NS.get(cpu).copied().unwrap_or(0);
             if start_ns > 0 && now > start_ns {
-                dag_add_thread_exec(bank, tid, cpu, now - start_ns);
+                if sample {
+                    dag_add_thread_exec(bank, tid, cpu, now - start_ns);
+                }
             }
             set_array_u64(&RUNNING_START_NS, cpu, now);
         }
@@ -413,7 +486,7 @@ fn current_frame_id() -> u64 {
 }
 
 fn dag_active_bank() -> u32 {
-    DAG_ACTIVE_BANK.get(0).copied().unwrap_or(0) & 1
+    DAG_ACTIVE_BANK.get(0).copied().unwrap_or(0) % DAG_BANKS
 }
 
 fn set_frame_id(frame_id: u64) {
@@ -427,7 +500,18 @@ fn set_frame_id(frame_id: u64) {
 fn set_dag_active_bank(bank: u32) {
     if let Some(ptr) = DAG_ACTIVE_BANK.get_ptr_mut(0) {
         unsafe {
-            *ptr = bank & 1;
+            *ptr = bank % DAG_BANKS;
+        }
+    }
+}
+
+fn set_bank_frame_id(bank: u32, frame_id: u64) {
+    if bank >= DAG_BANKS {
+        return;
+    }
+    if let Some(ptr) = BANK_FRAME_ID.get_ptr_mut(bank) {
+        unsafe {
+            *ptr = frame_id;
         }
     }
 }
@@ -464,10 +548,16 @@ fn dag_add_thread_exec(bank: u32, tid: u32, cpu: u32, delta: u64) {
         return;
     };
     let key = pack_tid_policy(tid, policy);
-    if bank == 0 {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_EXEC_0, key, delta);
-    } else {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_EXEC_1, key, delta);
+    match bank {
+        0 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_0, key, delta),
+        1 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_1, key, delta),
+        2 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_2, key, delta),
+        3 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_3, key, delta),
+        4 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_4, key, delta),
+        5 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_5, key, delta),
+        6 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_6, key, delta),
+        7 => add_hash_thread_exec(&DAG_THREAD_POLICY_STATS_7, key, delta),
+        _ => {}
     }
 }
 
@@ -476,10 +566,16 @@ fn dag_add_thread_rq(bank: u32, tid: u32, cpu: u32, delta: u64) {
         return;
     };
     let key = pack_tid_policy(tid, policy);
-    if bank == 0 {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_RQ_0, key, delta);
-    } else {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_RQ_1, key, delta);
+    match bank {
+        0 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_0, key, delta),
+        1 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_1, key, delta),
+        2 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_2, key, delta),
+        3 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_3, key, delta),
+        4 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_4, key, delta),
+        5 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_5, key, delta),
+        6 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_6, key, delta),
+        7 => add_hash_thread_rq(&DAG_THREAD_POLICY_STATS_7, key, delta),
+        _ => {}
     }
 }
 
@@ -488,10 +584,16 @@ fn dag_add_thread_futex(bank: u32, tid: u32, cpu: u32, delta: u64) {
         return;
     };
     let key = pack_tid_policy(tid, policy);
-    if bank == 0 {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_FUTEX_0, key, delta);
-    } else {
-        add_hash_u64_u64(&DAG_THREAD_POLICY_FUTEX_1, key, delta);
+    match bank {
+        0 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_0, key, delta),
+        1 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_1, key, delta),
+        2 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_2, key, delta),
+        3 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_3, key, delta),
+        4 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_4, key, delta),
+        5 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_5, key, delta),
+        6 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_6, key, delta),
+        7 => add_hash_thread_futex(&DAG_THREAD_POLICY_STATS_7, key, delta),
+        _ => {}
     }
 }
 
@@ -500,10 +602,16 @@ fn dag_add_edge(bank: u32, pred: u32, succ: u32, delta: u64) {
         return;
     }
     let key = ((pred as u64) << 32) | succ as u64;
-    if bank == 0 {
-        add_hash_u64_u64(&DAG_EDGE_0, key, delta);
-    } else {
-        add_hash_u64_u64(&DAG_EDGE_1, key, delta);
+    match bank {
+        0 => add_hash_u64_u64(&DAG_EDGE_0, key, delta),
+        1 => add_hash_u64_u64(&DAG_EDGE_1, key, delta),
+        2 => add_hash_u64_u64(&DAG_EDGE_2, key, delta),
+        3 => add_hash_u64_u64(&DAG_EDGE_3, key, delta),
+        4 => add_hash_u64_u64(&DAG_EDGE_4, key, delta),
+        5 => add_hash_u64_u64(&DAG_EDGE_5, key, delta),
+        6 => add_hash_u64_u64(&DAG_EDGE_6, key, delta),
+        7 => add_hash_u64_u64(&DAG_EDGE_7, key, delta),
+        _ => {}
     }
 }
 
@@ -527,6 +635,60 @@ fn add_hash_u64_u64(map: &HashMap<u64, u64>, key: u64, delta: u64) {
         }
     } else {
         let _ = map.insert(&key, &delta, 0);
+    }
+}
+
+fn add_hash_thread_exec(map: &HashMap<u64, DagThreadMetrics>, key: u64, delta: u64) {
+    if delta < EXEC_MIN_NS {
+        return;
+    }
+    if let Some(ptr) = map.get_ptr_mut(&key) {
+        unsafe {
+            (*ptr).exec_ns = (*ptr).exec_ns.saturating_add(delta);
+        }
+    } else {
+        let value = DagThreadMetrics {
+            exec_ns: delta,
+            rq_delay_ns: 0,
+            futex_wait_ns: 0,
+        };
+        let _ = map.insert(&key, &value, 0);
+    }
+}
+
+fn add_hash_thread_rq(map: &HashMap<u64, DagThreadMetrics>, key: u64, delta: u64) {
+    if delta < RQ_MIN_NS {
+        return;
+    }
+    if let Some(ptr) = map.get_ptr_mut(&key) {
+        unsafe {
+            (*ptr).rq_delay_ns = (*ptr).rq_delay_ns.saturating_add(delta);
+        }
+    } else {
+        let value = DagThreadMetrics {
+            exec_ns: 0,
+            rq_delay_ns: delta,
+            futex_wait_ns: 0,
+        };
+        let _ = map.insert(&key, &value, 0);
+    }
+}
+
+fn add_hash_thread_futex(map: &HashMap<u64, DagThreadMetrics>, key: u64, delta: u64) {
+    if delta < FUTEX_MIN_NS {
+        return;
+    }
+    if let Some(ptr) = map.get_ptr_mut(&key) {
+        unsafe {
+            (*ptr).futex_wait_ns = (*ptr).futex_wait_ns.saturating_add(delta);
+        }
+    } else {
+        let value = DagThreadMetrics {
+            exec_ns: 0,
+            rq_delay_ns: 0,
+            futex_wait_ns: delta,
+        };
+        let _ = map.insert(&key, &value, 0);
     }
 }
 
@@ -560,7 +722,9 @@ fn is_target_tid(tid: u32) -> bool {
 }
 
 fn mark_target_tid(tid: u32) {
-    let _ = TARGET_TIDS.insert(&tid, &1u8, 0);
+    if unsafe { TARGET_TIDS.get(&tid) }.is_none() {
+        let _ = TARGET_TIDS.insert(&tid, &1u8, 0);
+    }
 }
 
 fn allow_current_task() -> bool {

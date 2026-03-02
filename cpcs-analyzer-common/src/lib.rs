@@ -44,3 +44,14 @@ impl Event {
         }
     }
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct DagThreadMetrics {
+    pub exec_ns: u64,
+    pub rq_delay_ns: u64,
+    pub futex_wait_ns: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DagThreadMetrics {}

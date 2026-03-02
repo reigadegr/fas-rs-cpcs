@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    fs,
-    os::fd::AsRawFd,
+    fs, io,
+    os::fd::{AsFd, AsRawFd, RawFd},
     path::Path,
     ptr,
     sync::mpsc::RecvTimeoutError,
@@ -11,10 +11,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use aya::{
     Ebpf, include_bytes_aligned,
-    maps::{Array, HashMap as UserHashMap, MapData, RingBuf},
+    maps::{Array, HashMap as UserHashMap, IterableMap, MapData, RingBuf},
     programs::{TracePoint, UProbe},
 };
-use cpcs_analyzer_common::{Event, EventKind};
+use cpcs_analyzer_common::{DagThreadMetrics, Event, EventKind};
 use ctor::ctor;
 use log::warn;
 use mio::{Events, Interest, Poll, Token, event::Event as MioEvent, unix::SourceFd};
@@ -23,7 +23,12 @@ pub type Pid = i32;
 
 const EVENT_MAX: usize = 1024;
 const MAX_CPUS: u32 = 32;
+const DAG_BANKS: u32 = 8;
 const INVALID_POLICY: u32 = u32::MAX;
+const BATCH_ELEMS: usize = 1024;
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: libc::c_uint = 25;
+const MAX_DRAIN_PER_PID: usize = 8;
+const DIRECT_PROBE_STALE_AFTER: Duration = Duration::from_millis(80);
 
 const DEFAULT_UPROBE_SYMBOL: &str =
     "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE";
@@ -59,6 +64,7 @@ pub struct TimedPolicyWeights {
 pub struct AnalyzerConfig {
     pub uprobe_symbol: String,
     pub uprobe_lib: String,
+    pub direct_probe_fallback: bool,
     pub ema_lambda: f64,
     pub rq_weight: f64,
     pub futex_weight: f64,
@@ -75,6 +81,9 @@ impl Default for AnalyzerConfig {
         Self {
             uprobe_symbol: DEFAULT_UPROBE_SYMBOL.to_string(),
             uprobe_lib: DEFAULT_UPROBE_LIB.to_string(),
+            // Use direct probing only as stale-data fallback to handle devices
+            // where poll readiness may be sparse.
+            direct_probe_fallback: true,
             ema_lambda: 0.8,
             // Runqueue delay is retained for diagnosis, but does not directly
             // participate in DVFS weight scoring by default.
@@ -173,27 +182,20 @@ impl Analyzer {
         let deadline = Instant::now() + timeout;
         let mut polled_once = false;
 
-        loop {
-            // Some Android kernels/userspace combos do not reliably surface ringbuf
-            // readiness via poll for eBPF maps. Probe each attached ring once so we
-            // can still make progress even when poll misses notifications.
-            let direct_pids: Vec<_> = self.map.keys().copied().collect();
-            for pid in direct_pids {
-                if let Some(weights) = self.process_pid_update(pid) {
-                    return Ok((pid, weights));
-                }
-            }
-
+        let result = 'recv: loop {
             while let Some(pid) = self.buffer.pop_front() {
                 if let Some(weights) = self.process_pid_update(pid) {
-                    return Ok((pid, weights));
+                    break 'recv Ok((pid, weights));
                 }
             }
 
             let now = Instant::now();
             let timed_out = now >= deadline;
             if timed_out && polled_once {
-                return Err(RecvTimeoutError::Timeout);
+                if let Some((pid, weights)) = self.try_direct_probe() {
+                    break 'recv Ok((pid, weights));
+                }
+                break Err(RecvTimeoutError::Timeout);
             }
 
             let remain = if timed_out {
@@ -203,7 +205,7 @@ impl Analyzer {
             };
             let mut events = Events::with_capacity(EVENT_MAX);
             let Some(poll) = self.poll.as_mut() else {
-                return Err(RecvTimeoutError::Timeout);
+                break Err(RecvTimeoutError::Timeout);
             };
 
             match poll.poll(&mut events, Some(remain)) {
@@ -211,15 +213,23 @@ impl Analyzer {
                     polled_once = true;
                     if events.is_empty() {
                         if timed_out {
-                            return Err(RecvTimeoutError::Timeout);
+                            if let Some((pid, weights)) = self.try_direct_probe() {
+                                break 'recv Ok((pid, weights));
+                            }
+                            break Err(RecvTimeoutError::Timeout);
                         }
                         continue;
                     }
                     self.buffer.extend(events.iter().map(event_to_pid));
                 }
-                Err(_) => return Err(RecvTimeoutError::Disconnected),
+                Err(e) => {
+                    warn!("cpcs poll failed: {e}");
+                    break Err(RecvTimeoutError::Disconnected);
+                }
             }
-        }
+        };
+
+        result
     }
 
     pub fn latest_for(&self, pid: i32) -> Option<&PolicyWeights> {
@@ -228,6 +238,16 @@ impl Analyzer {
             return None;
         }
         Some(&item.data)
+    }
+
+    pub fn latest_or_poll(&mut self, pid: i32) -> Option<PolicyWeights> {
+        match self.recv_timeout(Duration::ZERO) {
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                warn!("cpcs analyzer disconnected while fetching weights");
+            }
+        }
+        self.latest_for(pid).cloned()
     }
 
     #[must_use]
@@ -260,30 +280,71 @@ impl Analyzer {
     }
 
     fn process_pid_update(&mut self, pid: i32) -> Option<PolicyWeights> {
-        let update_result = {
-            let target = self.map.get_mut(&pid)?;
-            target.update()
-        };
+        let mut last_weights: Option<PolicyWeights> = None;
 
-        match update_result {
-            Ok(Some(weights)) => {
-                self.latest.insert(
-                    pid,
-                    TimedPolicyWeights {
-                        received_at: Instant::now(),
-                        data: weights.clone(),
-                    },
-                );
-                Some(weights)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!("cpcs update failed for pid={pid}: {e:#}");
-                let _ = self.detach_app(pid);
-                None
+        for _ in 0..MAX_DRAIN_PER_PID {
+            let update_result = {
+                let target = self.map.get_mut(&pid)?;
+                target.update()
+            };
+
+            match update_result {
+                Ok(UpdateOutcome::Weights(weights)) => {
+                    last_weights = Some(weights);
+                }
+                Ok(UpdateOutcome::Skipped) => continue,
+                Ok(UpdateOutcome::RingEmpty) => break,
+                Err(e) => {
+                    warn!("cpcs update failed for pid={pid}: {e:#}");
+                    let _ = self.detach_app(pid);
+                    break;
+                }
             }
         }
+
+        if let Some(weights) = last_weights {
+            let now = Instant::now();
+            self.latest.insert(
+                pid,
+                TimedPolicyWeights {
+                    received_at: now,
+                    data: weights.clone(),
+                },
+            );
+            Some(weights)
+        } else {
+            None
+        }
     }
+
+    fn should_direct_probe(&self) -> bool {
+        if !self.cfg.direct_probe_fallback {
+            return false;
+        }
+        self.map.keys().any(|pid| {
+            self.latest
+                .get(pid)
+                .is_none_or(|item| item.received_at.elapsed() >= DIRECT_PROBE_STALE_AFTER)
+        })
+    }
+
+    fn direct_probe_once(&mut self) -> Option<(i32, PolicyWeights)> {
+        let pids: Vec<_> = self.map.keys().copied().collect();
+        for pid in pids {
+            if let Some(weights) = self.process_pid_update(pid) {
+                return Some((pid, weights));
+            }
+        }
+        None
+    }
+
+    fn try_direct_probe(&mut self) -> Option<(i32, PolicyWeights)> {
+        if !self.should_direct_probe() {
+            return None;
+        }
+        self.direct_probe_once()
+    }
+
 }
 
 fn validate_config(cfg: &AnalyzerConfig) -> Result<()> {
@@ -312,10 +373,25 @@ struct AnalyzeTarget {
     pid: i32,
     uprobe: UprobeHandler,
     ring: RingBuf<MapData>,
+    stats_map_fds: Vec<RawFd>,
+    edge_map_fds: Vec<RawFd>,
     cfg: AnalyzerConfig,
     policy_ids: Vec<u32>,
     policy_capacity: HashMap<u32, f64>,
     ema_scores: HashMap<u32, f64>,
+    frame_buf: DagFrame,
+    key_buf: Vec<u64>,
+    stats_value_buf: Vec<DagThreadMetrics>,
+    edge_value_buf: Vec<u64>,
+    stats_batch_enabled: bool,
+    edge_batch_enabled: bool,
+    last_tid_refresh: Instant,
+}
+
+enum UpdateOutcome {
+    RingEmpty,
+    Skipped,
+    Weights(PolicyWeights),
 }
 
 impl AnalyzeTarget {
@@ -331,6 +407,7 @@ impl AnalyzeTarget {
         init_target_filters(uprobe.bpf_mut(), Some(pid as u32))?;
         init_cpu_policy_filters(uprobe.bpf_mut(), &cpu_policy)?;
         init_dag_bank(uprobe.bpf_mut())?;
+        let (stats_map_fds, edge_map_fds) = collect_dag_bank_fds(uprobe.bpf_mut())?;
         let ring = uprobe.take_ring()?;
 
         let mut ema_scores = HashMap::new();
@@ -342,38 +419,77 @@ impl AnalyzeTarget {
             pid,
             uprobe,
             ring,
+            stats_map_fds,
+            edge_map_fds,
             cfg,
             policy_ids,
             policy_capacity,
             ema_scores,
+            frame_buf: DagFrame::default(),
+            key_buf: Vec::with_capacity(4096),
+            stats_value_buf: vec![DagThreadMetrics::default(); BATCH_ELEMS],
+            edge_value_buf: vec![0; BATCH_ELEMS],
+            stats_batch_enabled: true,
+            edge_batch_enabled: true,
+            last_tid_refresh: Instant::now(),
         })
     }
 
-    fn update(&mut self) -> Result<Option<PolicyWeights>> {
-        let Some(item) = self.ring.next() else {
-            return Ok(None);
+    fn update(&mut self) -> Result<UpdateOutcome> {
+        if self.last_tid_refresh.elapsed() >= Duration::from_secs(2) {
+            refresh_target_tids(self.uprobe.bpf_mut(), self.pid as u32)?;
+            self.last_tid_refresh = Instant::now();
+        }
+
+        let event = {
+            let Some(item) = self.ring.next() else {
+                return Ok(UpdateOutcome::RingEmpty);
+            };
+            // Copy event out, then drop RingBufItem immediately so later mutable
+            // borrows on `self` are not blocked by ring item lifetime.
+            unsafe { trans(&item) }
         };
-        let event = unsafe { trans(&item) };
 
         if event.kind != EventKind::FramePoint as u8 {
-            return Ok(None);
+            return Ok(UpdateOutcome::Skipped);
         }
 
         let closed_frame_id = event.arg0.saturating_sub(1);
         if closed_frame_id == 0 {
-            return Ok(None);
+            return Ok(UpdateOutcome::Skipped);
         }
 
-        let bank = (event.arg1 & 1) as u32;
-        let frame = collect_dag_frame(self.uprobe.bpf_mut(), closed_frame_id, bank)?;
+        let bank = event.arg1 as u32;
+        if bank >= DAG_BANKS {
+            return Ok(UpdateOutcome::Skipped);
+        }
+        let bank_frame_id = read_bank_frame_id(self.uprobe.bpf_mut(), bank)?;
+        if bank_frame_id != closed_frame_id {
+            return Ok(UpdateOutcome::Skipped);
+        }
+
+        collect_dag_frame(
+            self.uprobe.bpf_mut(),
+            closed_frame_id,
+            bank,
+            &self.stats_map_fds,
+            &self.edge_map_fds,
+            &mut self.frame_buf,
+            &mut self.key_buf,
+            &mut self.stats_value_buf,
+            &mut self.edge_value_buf,
+            &mut self.stats_batch_enabled,
+            &mut self.edge_batch_enabled,
+        )?;
+
         let cp = infer_critical_subgraph(
-            &frame,
+            &self.frame_buf,
             event.tid,
             self.cfg.subgraph_slack_ns,
             self.cfg.subgraph_tau_ns,
         );
 
-        let critical_stats = critical_subgraph_to_frame_stats(&frame, &cp);
+        let critical_stats = critical_subgraph_to_frame_stats(&self.frame_buf, &cp);
         let rows = analyze_cluster_weights(
             &critical_stats,
             &self.policy_ids,
@@ -392,10 +508,10 @@ impl AnalyzeTarget {
             policy_weights.insert(row.policy as i32, row.weight);
         }
         if policy_weights.is_empty() {
-            return Ok(None);
+            return Ok(UpdateOutcome::Skipped);
         }
 
-        Ok(Some(PolicyWeights {
+        Ok(UpdateOutcome::Weights(PolicyWeights {
             pid: self.pid,
             frame_id: closed_frame_id,
             confidence: critical_subgraph_confidence(&cp),
@@ -603,9 +719,19 @@ fn init_dag_bank(ebpf: &mut Ebpf) -> Result<()> {
         Array::try_from(ebpf.map_mut("FRAME_ID").unwrap())?;
     frame_id.set(0, 0u64, 0)?;
 
+    let mut sample_active: Array<&mut MapData, u32> =
+        Array::try_from(ebpf.map_mut("SAMPLE_ACTIVE").unwrap())?;
+    sample_active.set(0, 0u32, 0)?;
+
     let mut dag_active_bank: Array<&mut MapData, u32> =
         Array::try_from(ebpf.map_mut("DAG_ACTIVE_BANK").unwrap())?;
     dag_active_bank.set(0, 0u32, 0)?;
+
+    let mut bank_frame_id: Array<&mut MapData, u64> =
+        Array::try_from(ebpf.map_mut("BANK_FRAME_ID").unwrap())?;
+    for bank in 0..DAG_BANKS {
+        bank_frame_id.set(bank, 0u64, 0)?;
+    }
 
     Ok(())
 }
@@ -642,6 +768,31 @@ fn init_target_filters(ebpf: &mut Ebpf, pid: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+fn refresh_target_tids(ebpf: &mut Ebpf, pid: u32) -> Result<()> {
+    let tids = list_task_tids(pid)?;
+    let live: HashSet<u32> = tids.iter().copied().collect();
+
+    let mut target_tids: UserHashMap<&mut MapData, u32, u8> =
+        UserHashMap::try_from(ebpf.map_mut("TARGET_TIDS").unwrap())?;
+
+    let mut stale = Vec::new();
+    for item in target_tids.keys() {
+        let tid = item?;
+        if !live.contains(&tid) {
+            stale.push(tid);
+        }
+    }
+    for tid in stale {
+        let _ = target_tids.remove(&tid);
+    }
+
+    for tid in tids {
+        let _ = target_tids.insert(tid, 1u8, 0);
+    }
+
+    Ok(())
+}
+
 fn list_task_tids(pid: u32) -> Result<Vec<u32>> {
     let dir = format!("/proc/{pid}/task");
     let mut tids = Vec::new();
@@ -670,8 +821,14 @@ struct DagFrame {
 }
 
 impl DagFrame {
-    fn new() -> Self {
-        Self::default()
+    fn clear(&mut self) {
+        self.thread_exec_ns.clear();
+        self.thread_rq_delay_ns.clear();
+        self.thread_futex_wait_ns.clear();
+        self.thread_policy_exec_ns.clear();
+        self.thread_policy_rq_delay_ns.clear();
+        self.thread_policy_futex_wait_ns.clear();
+        self.edges_ns.clear();
     }
 
     fn thread_total_ns(&self, tid: u32) -> u64 {
@@ -707,71 +864,96 @@ struct PolicyWeightRow {
     smooth_norm_score: f64,
 }
 
-fn collect_dag_frame(ebpf: &mut Ebpf, frame_id: u64, bank: u32) -> Result<DagFrame> {
-    let _ = frame_id;
-    let mut frame = DagFrame::new();
+fn collect_dag_frame(
+    ebpf: &mut Ebpf,
+    _frame_id: u64,
+    bank: u32,
+    stats_map_fds: &[RawFd],
+    edge_map_fds: &[RawFd],
+    frame: &mut DagFrame,
+    keys_buf: &mut Vec<u64>,
+    stats_value_buf: &mut Vec<DagThreadMetrics>,
+    edge_value_buf: &mut Vec<u64>,
+    stats_batch_enabled: &mut bool,
+    edge_batch_enabled: &mut bool,
+) -> Result<()> {
+    frame.clear();
 
-    let (exec_name, rq_name, futex_name, edge_name) = if bank == 0 {
-        (
-            "DAG_THREAD_POLICY_EXEC_0",
-            "DAG_THREAD_POLICY_RQ_0",
-            "DAG_THREAD_POLICY_FUTEX_0",
-            "DAG_EDGE_0",
-        )
-    } else {
-        (
-            "DAG_THREAD_POLICY_EXEC_1",
-            "DAG_THREAD_POLICY_RQ_1",
-            "DAG_THREAD_POLICY_FUTEX_1",
-            "DAG_EDGE_1",
-        )
-    };
+    let (stats_name, edge_name) =
+        dag_bank_map_names(bank).ok_or_else(|| anyhow!("invalid dag bank: {bank}"))?;
+    let bank_idx = bank as usize;
+    let stats_map_fd = stats_map_fds.get(bank_idx).copied();
+    let edge_map_fd = edge_map_fds.get(bank_idx).copied();
 
-    pull_tid_policy_u64_map(
+    pull_tid_policy_stats_map(
         ebpf,
-        exec_name,
-        &mut frame.thread_exec_ns,
-        &mut frame.thread_policy_exec_ns,
+        stats_name,
+        stats_map_fd,
+        frame,
+        keys_buf,
+        stats_value_buf,
+        stats_batch_enabled,
     )?;
-    pull_tid_policy_u64_map(
+    pull_edge_map(
         ebpf,
-        rq_name,
-        &mut frame.thread_rq_delay_ns,
-        &mut frame.thread_policy_rq_delay_ns,
+        edge_name,
+        edge_map_fd,
+        &mut frame.edges_ns,
+        keys_buf,
+        edge_value_buf,
+        edge_batch_enabled,
     )?;
-    pull_tid_policy_u64_map(
-        ebpf,
-        futex_name,
-        &mut frame.thread_futex_wait_ns,
-        &mut frame.thread_policy_futex_wait_ns,
-    )?;
-    pull_edge_map(ebpf, edge_name, &mut frame.edges_ns)?;
 
-    Ok(frame)
+    Ok(())
 }
 
-fn pull_tid_policy_u64_map(
+fn read_bank_frame_id(ebpf: &mut Ebpf, bank: u32) -> Result<u64> {
+    let bank_frame_id: Array<&mut MapData, u64> =
+        Array::try_from(ebpf.map_mut("BANK_FRAME_ID").unwrap())?;
+    Ok(bank_frame_id.get(&bank, 0).unwrap_or(0))
+}
+
+fn pull_tid_policy_stats_map(
     ebpf: &mut Ebpf,
     map_name: &str,
-    by_tid: &mut HashMap<u32, u64>,
-    by_tid_policy: &mut HashMap<(u32, u32), u64>,
+    map_fd: Option<RawFd>,
+    frame: &mut DagFrame,
+    keys_buf: &mut Vec<u64>,
+    values_buf: &mut Vec<DagThreadMetrics>,
+    batch_enabled: &mut bool,
 ) -> Result<()> {
-    let mut map: UserHashMap<&mut MapData, u64, u64> =
+    if *batch_enabled {
+        if let Some(fd) = map_fd {
+            match drain_tid_policy_stats_batch(fd, frame, keys_buf, values_buf) {
+                Ok(()) => return Ok(()),
+                Err(err) if is_batch_not_supported(&err) => {
+                    *batch_enabled = false;
+                }
+                Err(err) => {
+                    return Err(anyhow!("batch drain failed for {map_name}: {}", err));
+                }
+            }
+        } else {
+            *batch_enabled = false;
+        }
+    }
+
+    let mut map: UserHashMap<&mut MapData, u64, DagThreadMetrics> =
         UserHashMap::try_from(ebpf.map_mut(map_name).unwrap())?;
 
-    let mut keys = Vec::new();
+    keys_buf.clear();
     for item in map.iter() {
-        let (k, v) = item?;
+        let (k, metrics) = item?;
         let tid = (k >> 32) as u32;
         let policy = k as u32;
-        add_u64(by_tid, tid, v);
-        by_tid_policy.insert((tid, policy), v);
-        keys.push(k);
+        append_tid_policy_metrics(frame, tid, policy, metrics);
+        keys_buf.push(k);
     }
 
-    for k in keys {
+    for k in keys_buf.iter().copied() {
         let _ = map.remove(&k);
     }
+    keys_buf.clear();
 
     Ok(())
 }
@@ -779,25 +961,252 @@ fn pull_tid_policy_u64_map(
 fn pull_edge_map(
     ebpf: &mut Ebpf,
     map_name: &str,
+    map_fd: Option<RawFd>,
     out: &mut HashMap<(u32, u32), u64>,
+    keys_buf: &mut Vec<u64>,
+    values_buf: &mut Vec<u64>,
+    batch_enabled: &mut bool,
 ) -> Result<()> {
+    if *batch_enabled {
+        if let Some(fd) = map_fd {
+            match drain_edge_map_batch(fd, out, keys_buf, values_buf) {
+                Ok(()) => return Ok(()),
+                Err(err) if is_batch_not_supported(&err) => {
+                    *batch_enabled = false;
+                }
+                Err(err) => {
+                    return Err(anyhow!("batch drain failed for {map_name}: {}", err));
+                }
+            }
+        } else {
+            *batch_enabled = false;
+        }
+    }
+
     let mut map: UserHashMap<&mut MapData, u64, u64> =
         UserHashMap::try_from(ebpf.map_mut(map_name).unwrap())?;
 
-    let mut keys = Vec::new();
+    keys_buf.clear();
     for item in map.iter() {
         let (k, v) = item?;
         let pred = (k >> 32) as u32;
         let succ = k as u32;
         out.insert((pred, succ), v);
-        keys.push(k);
+        keys_buf.push(k);
     }
 
-    for k in keys {
+    for k in keys_buf.iter().copied() {
         let _ = map.remove(&k);
     }
+    keys_buf.clear();
 
     Ok(())
+}
+
+fn dag_bank_map_names(bank: u32) -> Option<(&'static str, &'static str)> {
+    match bank {
+        0 => Some(("DAG_THREAD_POLICY_STATS_0", "DAG_EDGE_0")),
+        1 => Some(("DAG_THREAD_POLICY_STATS_1", "DAG_EDGE_1")),
+        2 => Some(("DAG_THREAD_POLICY_STATS_2", "DAG_EDGE_2")),
+        3 => Some(("DAG_THREAD_POLICY_STATS_3", "DAG_EDGE_3")),
+        4 => Some(("DAG_THREAD_POLICY_STATS_4", "DAG_EDGE_4")),
+        5 => Some(("DAG_THREAD_POLICY_STATS_5", "DAG_EDGE_5")),
+        6 => Some(("DAG_THREAD_POLICY_STATS_6", "DAG_EDGE_6")),
+        7 => Some(("DAG_THREAD_POLICY_STATS_7", "DAG_EDGE_7")),
+        _ => None,
+    }
+}
+
+fn collect_dag_bank_fds(ebpf: &mut Ebpf) -> Result<(Vec<RawFd>, Vec<RawFd>)> {
+    let mut stats_fds = Vec::with_capacity(DAG_BANKS as usize);
+    let mut edge_fds = Vec::with_capacity(DAG_BANKS as usize);
+
+    for bank in 0..DAG_BANKS {
+        let (stats_name, edge_name) =
+            dag_bank_map_names(bank).ok_or_else(|| anyhow!("invalid dag bank: {bank}"))?;
+
+        let stats_fd = {
+            let stats_map: UserHashMap<&mut MapData, u64, DagThreadMetrics> =
+                UserHashMap::try_from(ebpf.map_mut(stats_name).unwrap())?;
+            stats_map.map().fd().as_fd().as_raw_fd()
+        };
+        stats_fds.push(stats_fd);
+
+        let edge_fd = {
+            let edge_map: UserHashMap<&mut MapData, u64, u64> =
+                UserHashMap::try_from(ebpf.map_mut(edge_name).unwrap())?;
+            edge_map.map().fd().as_fd().as_raw_fd()
+        };
+        edge_fds.push(edge_fd);
+    }
+
+    Ok((stats_fds, edge_fds))
+}
+
+fn append_tid_policy_metrics(
+    frame: &mut DagFrame,
+    tid: u32,
+    policy: u32,
+    metrics: DagThreadMetrics,
+) {
+    if metrics.exec_ns > 0 {
+        add_u64(&mut frame.thread_exec_ns, tid, metrics.exec_ns);
+        frame
+            .thread_policy_exec_ns
+            .insert((tid, policy), metrics.exec_ns);
+    }
+    if metrics.rq_delay_ns > 0 {
+        add_u64(&mut frame.thread_rq_delay_ns, tid, metrics.rq_delay_ns);
+        frame
+            .thread_policy_rq_delay_ns
+            .insert((tid, policy), metrics.rq_delay_ns);
+    }
+    if metrics.futex_wait_ns > 0 {
+        add_u64(&mut frame.thread_futex_wait_ns, tid, metrics.futex_wait_ns);
+        frame
+            .thread_policy_futex_wait_ns
+            .insert((tid, policy), metrics.futex_wait_ns);
+    }
+}
+
+fn drain_tid_policy_stats_batch(
+    map_fd: RawFd,
+    frame: &mut DagFrame,
+    keys_buf: &mut Vec<u64>,
+    values_buf: &mut Vec<DagThreadMetrics>,
+) -> io::Result<()> {
+    if keys_buf.len() < BATCH_ELEMS {
+        keys_buf.resize(BATCH_ELEMS, 0);
+    }
+    if values_buf.len() < BATCH_ELEMS {
+        values_buf.resize(BATCH_ELEMS, DagThreadMetrics::default());
+    }
+
+    let mut in_batch_token = 0u64;
+    let mut has_in_batch = false;
+    loop {
+        let mut out_batch_token = 0u64;
+        let (count, ended) = bpf_map_lookup_and_delete_batch(
+            map_fd,
+            has_in_batch.then_some(&in_batch_token),
+            &mut out_batch_token,
+            &mut keys_buf[..BATCH_ELEMS],
+            &mut values_buf[..BATCH_ELEMS],
+        )?;
+
+        for idx in 0..count {
+            let key = keys_buf[idx];
+            let tid = (key >> 32) as u32;
+            let policy = key as u32;
+            append_tid_policy_metrics(frame, tid, policy, values_buf[idx]);
+        }
+
+        if ended || count == 0 {
+            break;
+        }
+        in_batch_token = out_batch_token;
+        has_in_batch = true;
+    }
+    Ok(())
+}
+
+fn drain_edge_map_batch(
+    map_fd: RawFd,
+    out: &mut HashMap<(u32, u32), u64>,
+    keys_buf: &mut Vec<u64>,
+    values_buf: &mut Vec<u64>,
+) -> io::Result<()> {
+    if keys_buf.len() < BATCH_ELEMS {
+        keys_buf.resize(BATCH_ELEMS, 0);
+    }
+    if values_buf.len() < BATCH_ELEMS {
+        values_buf.resize(BATCH_ELEMS, 0);
+    }
+
+    let mut in_batch_token = 0u64;
+    let mut has_in_batch = false;
+    loop {
+        let mut out_batch_token = 0u64;
+        let (count, ended) = bpf_map_lookup_and_delete_batch(
+            map_fd,
+            has_in_batch.then_some(&in_batch_token),
+            &mut out_batch_token,
+            &mut keys_buf[..BATCH_ELEMS],
+            &mut values_buf[..BATCH_ELEMS],
+        )?;
+
+        for idx in 0..count {
+            let key = keys_buf[idx];
+            let pred = (key >> 32) as u32;
+            let succ = key as u32;
+            out.insert((pred, succ), values_buf[idx]);
+        }
+
+        if ended || count == 0 {
+            break;
+        }
+        in_batch_token = out_batch_token;
+        has_in_batch = true;
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct BpfMapBatchAttr {
+    in_batch: u64,
+    out_batch: u64,
+    keys: u64,
+    values: u64,
+    count: u32,
+    map_fd: u32,
+    elem_flags: u64,
+    flags: u64,
+}
+
+fn bpf_map_lookup_and_delete_batch<V: Copy>(
+    map_fd: RawFd,
+    in_batch: Option<&u64>,
+    out_batch: &mut u64,
+    keys: &mut [u64],
+    values: &mut [V],
+) -> io::Result<(usize, bool)> {
+    debug_assert_eq!(keys.len(), values.len());
+    let mut attr = BpfMapBatchAttr {
+        in_batch: in_batch.map_or(0, |token| token as *const u64 as u64),
+        out_batch: out_batch as *mut u64 as u64,
+        keys: keys.as_mut_ptr() as u64,
+        values: values.as_mut_ptr() as u64,
+        count: keys.len() as u32,
+        map_fd: map_fd as u32,
+        elem_flags: 0,
+        flags: 0,
+    };
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_LOOKUP_AND_DELETE_BATCH as libc::c_long,
+            &mut attr as *mut BpfMapBatchAttr as *mut libc::c_void,
+            std::mem::size_of::<BpfMapBatchAttr>(),
+        )
+    };
+
+    if ret >= 0 {
+        return Ok((attr.count as usize, false));
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOENT) {
+        return Ok((attr.count as usize, true));
+    }
+    Err(err)
+}
+
+fn is_batch_not_supported(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
 }
 
 fn infer_critical_subgraph(
