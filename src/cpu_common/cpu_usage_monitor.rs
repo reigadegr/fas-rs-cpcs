@@ -23,7 +23,7 @@ use anyhow::Result;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UsageSnapshot {
-    pub cpu0_util: f64,
+    pub cpu1_util: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,14 +70,14 @@ impl CpuUsageTracker {
 
 #[derive(Debug)]
 pub struct CpuUsageMonitor {
-    cpu0_tracker: CpuUsageTracker,
+    cpu1_tracker: CpuUsageTracker,
     last_update: Instant,
 }
 
 impl CpuUsageMonitor {
     pub fn new() -> Self {
         Self {
-            cpu0_tracker: CpuUsageTracker::new("cpu0"),
+            cpu1_tracker: CpuUsageTracker::new("cpu1"),
             last_update: Instant::now(),
         }
     }
@@ -88,14 +88,14 @@ impl CpuUsageMonitor {
         }
 
         self.last_update = Instant::now();
-        let cpu0_util = self
-            .cpu0_tracker
+        let cpu1_util = self
+            .cpu1_tracker
             .try_calculate()
             .ok()
             .flatten()
             .unwrap_or(0.0);
 
-        Some(UsageSnapshot { cpu0_util })
+        Some(UsageSnapshot { cpu1_util })
     }
 }
 

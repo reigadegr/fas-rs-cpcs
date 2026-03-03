@@ -94,8 +94,8 @@ where
 
     let self_pid = process::id();
     let _ = fs::write("/dev/cpuset/background/cgroup.procs", self_pid.to_string());
-    if let Err(e) = pin_self_to_cpu0() {
-        warn!("Failed to set fas-rs affinity to cpu0: {e:#}");
+    if let Err(e) = pin_self_to_cpu1() {
+        warn!("Failed to set fas-rs affinity to cpu1: {e:#}");
     }
 
     let config = Config::new(USER_CONFIG, std_path)?;
@@ -121,11 +121,11 @@ fn log_format(
     write!(write, "[{time}] {}: {}", record.level(), record.args())
 }
 
-fn pin_self_to_cpu0() -> Result<()> {
+fn pin_self_to_cpu1() -> Result<()> {
     let mut cpuset = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
     unsafe {
         libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(0usize, &mut cpuset);
+        libc::CPU_SET(1usize, &mut cpuset);
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset) != 0 {
             return Err(io::Error::last_os_error().into());
         }

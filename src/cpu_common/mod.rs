@@ -51,13 +51,13 @@ pub struct Controller {
     cpu_infos: Vec<Info>,
     file_handler: FileHandler,
     usage_monitor: CpuUsageMonitor,
-    util_cpu0: Option<f64>,
+    util_cpu1: Option<f64>,
     total_budget_khz: Option<isize>,
 }
 
 impl Controller {
     const P0_POLICY: i32 = 0;
-    const CPU0_UTIL_TARGET: f64 = 0.95;
+    const CPU1_UTIL_TARGET: f64 = 0.95;
 
     pub fn new() -> Result<Self> {
         let mut cpu_infos = Self::load_cpu_infos()?;
@@ -83,7 +83,7 @@ impl Controller {
             cpu_infos,
             file_handler: FileHandler::new(),
             usage_monitor: CpuUsageMonitor::new(),
-            util_cpu0: None,
+            util_cpu1: None,
             total_budget_khz: None,
         })
     }
@@ -138,7 +138,7 @@ impl Controller {
         trigger_init_cpu_freq(extension);
         self.reset_all_cpu_freq();
         self.sync_cur_freq_from_hw();
-        self.util_cpu0 = None;
+        self.util_cpu1 = None;
         self.total_budget_khz = None;
     }
 
@@ -146,7 +146,7 @@ impl Controller {
         trigger_reset_cpu_freq(extension);
         self.reset_all_cpu_freq();
         self.sync_cur_freq_from_hw();
-        self.util_cpu0 = None;
+        self.util_cpu1 = None;
         self.total_budget_khz = None;
     }
 
@@ -271,9 +271,9 @@ impl Controller {
         out
     }
 
-    fn update_cpu0_util(&mut self) {
+    fn update_cpu1_util(&mut self) {
         if let Some(snapshot) = self.usage_monitor.update() {
-            self.util_cpu0 = Some(snapshot.cpu0_util);
+            self.util_cpu1 = Some(snapshot.cpu1_util);
         }
     }
 
@@ -291,8 +291,8 @@ impl Controller {
     }
 
     fn compute_p0_guard_freq_khz(&self) -> Option<isize> {
-        let cpu0_util = self.util_cpu0?;
-        if cpu0_util <= Self::CPU0_UTIL_TARGET {
+        let cpu1_util = self.util_cpu1?;
+        if cpu1_util <= Self::CPU1_UTIL_TARGET {
             return None;
         }
         let p0_info = self
@@ -302,7 +302,7 @@ impl Controller {
         let min = *p0_info.freqs.first()?;
         let max = *p0_info.freqs.last()?;
         let current = p0_info.cur_fas_freq.clamp(min, max);
-        let guarded = ((current as f64) * (cpu0_util / Self::CPU0_UTIL_TARGET)).round() as isize;
+        let guarded = ((current as f64) * (cpu1_util / Self::CPU1_UTIL_TARGET)).round() as isize;
         Some(guarded.clamp(min, max))
     }
 
@@ -328,7 +328,7 @@ impl Controller {
         }
 
         if !is_janked {
-            self.update_cpu0_util();
+            self.update_cpu1_util();
         }
 
         let mut total_min = 0isize;
