@@ -54,7 +54,7 @@ use crate::{
 };
 
 const DELAY_TIME: Duration = Duration::from_secs(3);
-const CPCS_RECV_TIMEOUT: Duration = Duration::from_millis(20);
+const CPCS_RECV_TIMEOUT: Duration = Duration::from_millis(150);
 const CPCS_STALE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(PartialEq, Debug)]
 enum State {
