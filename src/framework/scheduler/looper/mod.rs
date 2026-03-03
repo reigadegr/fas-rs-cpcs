@@ -289,6 +289,8 @@ impl Looper {
     }
 
     pub fn retain_topapp(&mut self) {
+        self.prune_stale_cpcs_attachments();
+
         if let Some(buffer) = self.fas_state.buffer.as_ref() {
             if !self
                 .windows_watcher
@@ -365,6 +367,21 @@ impl Looper {
         }
     }
 
+    fn prune_stale_cpcs_attachments(&mut self) {
+        let topapps: HashSet<i32> = self.windows_watcher.topapp_pids().iter().copied().collect();
+        let stale: Vec<i32> = self
+            .cpcs_attached
+            .iter()
+            .copied()
+            .filter(|pid| !topapps.contains(pid))
+            .collect();
+
+        for pid in stale {
+            self.cpcs_attached.remove(&pid);
+            let _ = self.cpcs_state.cmd_tx.send(CpcsWorkerCmd::Detach(pid));
+        }
+    }
+
     pub fn buffer_update(&mut self, data: &FasData) -> Option<BufferWorkingState> {
         if unlikely(
             !self.windows_watcher.topapp_pids().contains(&data.pid) || data.frametime.is_zero(),
@@ -438,6 +455,11 @@ fn cpcs_worker_loop(
             }
         }
 
+        reconcile_worker_attached(&analyzer, &mut attached, &latest);
+        if attached.is_empty() {
+            continue;
+        }
+
         match analyzer.recv_timeout(CPCS_RECV_TIMEOUT) {
             Ok((pid, weights)) => {
                 if let Ok(mut guard) = latest.lock() {
@@ -457,6 +479,8 @@ fn cpcs_worker_loop(
                 return;
             }
         }
+
+        reconcile_worker_attached(&analyzer, &mut attached, &latest);
     }
 }
 
@@ -481,5 +505,21 @@ fn handle_cpcs_cmd(
                 guard.remove(&pid);
             }
         }
+    }
+}
+
+fn reconcile_worker_attached(
+    analyzer: &CpcsAnalyzer,
+    attached: &mut HashSet<i32>,
+    latest: &Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
+) {
+    let live: HashSet<i32> = analyzer.pids().collect();
+    if *attached == live {
+        return;
+    }
+
+    *attached = live.clone();
+    if let Ok(mut guard) = latest.lock() {
+        guard.retain(|pid, _| live.contains(pid));
     }
 }
