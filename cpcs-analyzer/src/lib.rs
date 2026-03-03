@@ -27,8 +27,7 @@ const DAG_BANKS: u32 = 8;
 const INVALID_POLICY: u32 = u32::MAX;
 const BATCH_ELEMS: usize = 1024;
 const BPF_MAP_LOOKUP_AND_DELETE_BATCH: libc::c_uint = 25;
-const MAX_DRAIN_PER_PID: usize = 8;
-const DIRECT_PROBE_STALE_AFTER: Duration = Duration::from_millis(80);
+const DIRECT_PROBE_STALE_AFTER: Duration = Duration::from_millis(300);
 
 const DEFAULT_UPROBE_SYMBOL: &str =
     "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE";
@@ -91,7 +90,7 @@ impl Default for AnalyzerConfig {
             // Futex time remains part of DAG/critical-subgraph extraction, but
             // does not directly participate in DVFS weight scoring.
             futex_weight: 0.0,
-            exec_weight: 0.75,
+            exec_weight: 1.0,
             subgraph_slack_ns: 300_000,
             subgraph_tau_ns: 300_000,
             norm_mix: 0.3,
@@ -280,41 +279,30 @@ impl Analyzer {
     }
 
     fn process_pid_update(&mut self, pid: i32) -> Option<PolicyWeights> {
-        let mut last_weights: Option<PolicyWeights> = None;
+        let update_result = {
+            let target = self.map.get_mut(&pid)?;
+            target.update()
+        };
 
-        for _ in 0..MAX_DRAIN_PER_PID {
-            let update_result = {
-                let target = self.map.get_mut(&pid)?;
-                target.update()
-            };
-
-            match update_result {
-                Ok(UpdateOutcome::Weights(weights)) => {
-                    last_weights = Some(weights);
-                }
-                Ok(UpdateOutcome::Skipped) => continue,
-                Ok(UpdateOutcome::RingEmpty) => break,
-                Err(e) => {
-                    warn!("cpcs update failed for pid={pid}: {e:#}");
-                    let _ = self.detach_app(pid);
-                    break;
-                }
+        let weights = match update_result {
+            Ok(UpdateOutcome::Weights(weights)) => weights,
+            Ok(UpdateOutcome::Skipped) | Ok(UpdateOutcome::RingEmpty) => return None,
+            Err(e) => {
+                warn!("cpcs update failed for pid={pid}: {e:#}");
+                let _ = self.detach_app(pid);
+                return None;
             }
-        }
+        };
 
-        if let Some(weights) = last_weights {
-            let now = Instant::now();
-            self.latest.insert(
-                pid,
-                TimedPolicyWeights {
-                    received_at: now,
-                    data: weights.clone(),
-                },
-            );
-            Some(weights)
-        } else {
-            None
-        }
+        let now = Instant::now();
+        self.latest.insert(
+            pid,
+            TimedPolicyWeights {
+                received_at: now,
+                data: weights.clone(),
+            },
+        );
+        Some(weights)
     }
 
     fn should_direct_probe(&self) -> bool {
