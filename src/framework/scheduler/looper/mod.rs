@@ -23,7 +23,8 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        atomic::{AtomicU64, Ordering},
+        mpsc::RecvTimeoutError,
     },
     thread,
     time::{Duration, Instant},
@@ -76,8 +77,10 @@ struct AnalyzerState {
 }
 
 struct CpcsState {
-    cmd_tx: Sender<CpcsWorkerCmd>,
+    desired: Arc<Mutex<HashSet<i32>>>,
+    generation: Arc<AtomicU64>,
     latest: Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
+    worker: thread::Thread,
 }
 
 struct ControllerState {
@@ -90,11 +93,6 @@ struct ControllerState {
 struct TimedCpcsWeights {
     received_at: Instant,
     data: cpcs_analyzer::PolicyWeights,
-}
-
-enum CpcsWorkerCmd {
-    Attach(i32),
-    Detach(i32),
 }
 
 pub struct Looper {
@@ -209,6 +207,7 @@ impl Looper {
     }
 
     fn update_analyzer(&mut self) {
+        let mut cpcs_changed = false;
         for pid in self.windows_watcher.topapp_pids().iter().copied() {
             let Ok(pkg) = get_process_name(pid) else {
                 continue;
@@ -219,12 +218,12 @@ impl Looper {
             }
 
             let _ = self.analyzer_state.analyzer.attach_app(pid);
-            if self.cpcs_attached.insert(pid)
-                && self.cpcs_state.cmd_tx.send(CpcsWorkerCmd::Attach(pid)).is_err()
-            {
-                self.cpcs_attached.remove(&pid);
+            if self.cpcs_attached.insert(pid) {
+                cpcs_changed = true;
             }
         }
+
+        self.publish_cpcs_targets(cpcs_changed);
     }
 
     fn cpcs_weights_for(&mut self, pid: i32) -> Option<cpcs_analyzer::PolicyWeights> {
@@ -301,12 +300,11 @@ impl Looper {
                     .analyzer_state
                     .analyzer
                     .detach_app(buffer.package_info.pid);
+                let mut cpcs_changed = false;
                 if self.cpcs_attached.remove(&buffer.package_info.pid) {
-                    let _ = self
-                        .cpcs_state
-                        .cmd_tx
-                        .send(CpcsWorkerCmd::Detach(buffer.package_info.pid));
+                    cpcs_changed = true;
                 }
+                self.publish_cpcs_targets(cpcs_changed);
                 let pkg = buffer.package_info.pkg.clone();
                 trigger_unload_fas(&self.extension, buffer.package_info.pid, pkg);
                 self.fas_state.buffer = None;
@@ -376,10 +374,25 @@ impl Looper {
             .filter(|pid| !topapps.contains(pid))
             .collect();
 
+        let mut changed = false;
         for pid in stale {
-            self.cpcs_attached.remove(&pid);
-            let _ = self.cpcs_state.cmd_tx.send(CpcsWorkerCmd::Detach(pid));
+            if self.cpcs_attached.remove(&pid) {
+                changed = true;
+            }
         }
+        self.publish_cpcs_targets(changed);
+    }
+
+    fn publish_cpcs_targets(&self, changed: bool) {
+        if !changed {
+            return;
+        }
+
+        if let Ok(mut desired) = self.cpcs_state.desired.lock() {
+            *desired = self.cpcs_attached.clone();
+        }
+        self.cpcs_state.generation.fetch_add(1, Ordering::Release);
+        self.cpcs_state.worker.unpark();
     }
 
     pub fn buffer_update(&mut self, data: &FasData) -> Option<BufferWorkingState> {
@@ -416,47 +429,48 @@ impl Looper {
 }
 
 fn spawn_cpcs_worker(analyzer: CpcsAnalyzer) -> CpcsState {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let desired = Arc::new(Mutex::new(HashSet::new()));
+    let generation = Arc::new(AtomicU64::new(0));
     let latest = Arc::new(Mutex::new(HashMap::new()));
+    let desired_worker = Arc::clone(&desired);
+    let generation_worker = Arc::clone(&generation);
     let latest_worker = Arc::clone(&latest);
 
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("cpcs".to_string())
-        .spawn(move || cpcs_worker_loop(analyzer, cmd_rx, latest_worker))
-        .expect("failed to spawn cpcs worker");
+        .spawn(move || {
+            cpcs_worker_loop(analyzer, desired_worker, generation_worker, latest_worker)
+        })
+        .expect("failed to spawn cpcs worker")
+        .thread()
+        .clone();
 
-    CpcsState { cmd_tx, latest }
+    CpcsState {
+        desired,
+        generation,
+        latest,
+        worker,
+    }
 }
 
 fn cpcs_worker_loop(
     mut analyzer: CpcsAnalyzer,
-    cmd_rx: Receiver<CpcsWorkerCmd>,
+    desired: Arc<Mutex<HashSet<i32>>>,
+    generation: Arc<AtomicU64>,
     latest: Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
 ) {
     let mut attached = HashSet::new();
+    let mut applied_generation = u64::MAX;
 
     loop {
-        // When no app is attached, block for commands and avoid spinning.
-        if attached.is_empty() {
-            match cmd_rx.recv() {
-                Ok(cmd) => {
-                    handle_cpcs_cmd(&mut analyzer, &latest, &mut attached, cmd);
-                    continue;
-                }
-                Err(_) => return,
-            }
+        let latest_generation = generation.load(Ordering::Acquire);
+        if latest_generation != applied_generation {
+            reconcile_cpcs_targets(&mut analyzer, &desired, &latest, &mut attached);
+            applied_generation = latest_generation;
         }
 
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => handle_cpcs_cmd(&mut analyzer, &latest, &mut attached, cmd),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        }
-
-        reconcile_worker_attached(&analyzer, &mut attached, &latest);
         if attached.is_empty() {
+            thread::park_timeout(Duration::from_millis(250));
             continue;
         }
 
@@ -479,46 +493,46 @@ fn cpcs_worker_loop(
                 return;
             }
         }
-
-        reconcile_worker_attached(&analyzer, &mut attached, &latest);
     }
 }
 
-fn handle_cpcs_cmd(
+fn reconcile_cpcs_targets(
     analyzer: &mut CpcsAnalyzer,
+    desired: &Arc<Mutex<HashSet<i32>>>,
     latest: &Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
     attached: &mut HashSet<i32>,
-    cmd: CpcsWorkerCmd,
 ) {
-    match cmd {
-        CpcsWorkerCmd::Attach(pid) => {
-            if attached.insert(pid) && let Err(e) = analyzer.attach_app(pid) {
-                warn!("cpcs worker attach failed pid={pid}: {e:#}");
-                attached.remove(&pid);
-            }
+    let desired_snapshot = desired.lock().map(|set| set.clone()).unwrap_or_default();
+
+    let stale: Vec<i32> = attached
+        .iter()
+        .copied()
+        .filter(|pid| !desired_snapshot.contains(pid))
+        .collect();
+    for pid in stale {
+        attached.remove(&pid);
+        if let Err(e) = analyzer.detach_app(pid) {
+            warn!("cpcs worker detach failed pid={pid}: {e:#}");
         }
-        CpcsWorkerCmd::Detach(pid) => {
-            if attached.remove(&pid) && let Err(e) = analyzer.detach_app(pid) {
-                warn!("cpcs worker detach failed pid={pid}: {e:#}");
-            }
+        if let Ok(mut guard) = latest.lock() {
+            guard.remove(&pid);
+        }
+    }
+
+    for pid in desired_snapshot {
+        if attached.insert(pid) && let Err(e) = analyzer.attach_app(pid) {
+            warn!("cpcs worker attach failed pid={pid}: {e:#}");
+            attached.remove(&pid);
             if let Ok(mut guard) = latest.lock() {
                 guard.remove(&pid);
             }
         }
     }
-}
 
-fn reconcile_worker_attached(
-    analyzer: &CpcsAnalyzer,
-    attached: &mut HashSet<i32>,
-    latest: &Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
-) {
     let live: HashSet<i32> = analyzer.pids().collect();
-    if *attached == live {
-        return;
+    if *attached != live {
+        *attached = live.clone();
     }
-
-    *attached = live.clone();
     if let Ok(mut guard) = latest.lock() {
         guard.retain(|pid, _| live.contains(pid));
     }
