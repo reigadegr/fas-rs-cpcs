@@ -16,6 +16,7 @@
 # with fas-rs. If not, see <https://www.gnu.org/licenses/>.
 
 [workspace]
+resolver = "2"
 members = ["xtask", "cpcs-analyzer", "cpcs-analyzer-common", "cpcs-analyzer-ebpf"]
 default-members = [".", "xtask", "cpcs-analyzer"]
 
