@@ -17,16 +17,16 @@
 
 headerPath = "LICENSE_HEADER"
 includes = [
-    "licenserc.toml",
-    "src/**",
-    "Cargo.toml",
-    "build.rs",
-    "maketools/**",
-    "module/**",
-    ".github/**",
-    ".cargo/**",
-    "xtask/src/**",
-    "xtask/Cargo.toml",
+  "licenserc.toml",
+  "src/**",
+  "Cargo.toml",
+  "build.rs",
+  "maketools/**",
+  "module/**",
+  ".github/**",
+  ".cargo/**",
+  "xtask/src/**",
+  "xtask/Cargo.toml",
 ]
 excludes = ["module/games.toml", "module/META-INF/**", "module/*.prop"]
 
