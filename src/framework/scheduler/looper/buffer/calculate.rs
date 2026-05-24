@@ -64,9 +64,7 @@ impl Buffer {
             .saturating_add(self.frametime_state.additional_frametime);
 
         let divisor = take_count.min(frametime_count).try_into().unwrap();
-        total_time
-            .checked_div(divisor)
-            .unwrap_or(Duration::ZERO)
+        total_time.checked_div(divisor).unwrap_or(Duration::ZERO)
     }
 
     pub fn calculate_target_fps(&mut self, extension: &Extension) {

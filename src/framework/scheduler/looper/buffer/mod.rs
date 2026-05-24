@@ -120,9 +120,7 @@ impl Buffer {
         self.state.last_update = Instant::now();
 
         let target_fps = self.target_fps_state.target_fps.unwrap_or(144);
-        while self.frametime_state.frametimes.len()
-            >= target_fps as usize * 5
-        {
+        while self.frametime_state.frametimes.len() >= target_fps as usize * 5 {
             self.frametime_state.frametimes.pop_back();
             self.try_usable();
         }

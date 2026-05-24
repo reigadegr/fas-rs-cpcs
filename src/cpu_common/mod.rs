@@ -30,12 +30,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use cpu_info::Info;
+use cpu_usage_monitor::CpuUsageMonitor;
 use extra_policy::ExtraPolicy;
 #[cfg(debug_assertions)]
 use log::debug;
 use log::warn;
 use parking_lot::Mutex;
-use cpu_usage_monitor::CpuUsageMonitor;
 
 use crate::{
     Extension,
@@ -319,11 +319,7 @@ impl Controller {
         false
     }
 
-    fn compute_target_frequencies(
-        &mut self,
-        control_ratio: f64,
-        is_janked: bool,
-    ) -> isize {
+    fn compute_target_frequencies(&mut self, control_ratio: f64, is_janked: bool) -> isize {
         if self.cpu_infos.is_empty() {
             return 0;
         }
@@ -478,10 +474,7 @@ impl Controller {
 
                         let min = rel_bound.min.map_or(isize::MIN, |min| min);
                         let max = rel_bound.max.map_or(isize::MAX, |max| max);
-                        freq.clamp(
-                            rel_to_freq + min,
-                            rel_to_freq + max,
-                        )
+                        freq.clamp(rel_to_freq + min, rel_to_freq + max)
                     }
                     _ => freq,
                 };
