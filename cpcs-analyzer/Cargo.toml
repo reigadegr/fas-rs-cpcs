@@ -12,6 +12,7 @@ ctor = "1.0.6"
 libc = "0.2.186"
 log = "0.4.29"
 mio = { version = "1.2.0", features = ["os-ext"] }
+rustix = { version = "1.1.4", features = ["process"] }
 
 [build-dependencies]
 anyhow = "1.0.102"

@@ -26,7 +26,7 @@ const MAX_CPUS: u32 = 32;
 const DAG_BANKS: u32 = 8;
 const INVALID_POLICY: u32 = u32::MAX;
 const BATCH_ELEMS: usize = 1024;
-const BPF_MAP_LOOKUP_AND_DELETE_BATCH: libc::c_uint = 25;
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
 const DIRECT_PROBE_STALE_AFTER: Duration = Duration::from_millis(300);
 
 const DEFAULT_UPROBE_SYMBOL: &str =
@@ -36,13 +36,13 @@ const DEFAULT_UPROBE_LIB: &str = "/system/lib64/libgui.so";
 
 #[ctor(unsafe)]
 fn ebpf_workaround() {
-    let rlim = libc::rlimit {
-        rlim_cur: libc::RLIM_INFINITY,
-        rlim_max: libc::RLIM_INFINITY,
-    };
-    unsafe {
-        libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim);
-    }
+    let _ = rustix::process::setrlimit(
+        rustix::process::Resource::Memlock,
+        rustix::process::Rlimit {
+            current: None,
+            maximum: None,
+        },
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -432,7 +432,7 @@ impl AnalyzeTarget {
             };
             // Copy event out, then drop RingBufItem immediately so later mutable
             // borrows on `self` are not blocked by ring item lifetime.
-            unsafe { trans(&item) }
+            trans(&item)
         };
 
         if event.kind != EventKind::FramePoint as u8 {
@@ -1653,6 +1653,6 @@ fn event_to_pid(event: &MioEvent) -> Pid {
     pid as Pid
 }
 
-const unsafe fn trans(buf: &[u8]) -> Event {
+fn trans(buf: &[u8]) -> Event {
     unsafe { ptr::read_unaligned(buf.as_ptr().cast::<Event>()) }
 }
