@@ -52,12 +52,11 @@ impl Thermal {
                 nodes.push(device.path().join("temp"));
             }
         }
-
         Ok(Self {
             target_fps_offset: 0.0,
             core_temperature: 0,
             nodes,
-            last_temp_update: Instant::now() - TEMP_UPDATE_INTERVAL,
+            last_temp_update: Instant::now().checked_sub(TEMP_UPDATE_INTERVAL).unwrap(),
         })
     }
 
@@ -88,12 +87,12 @@ impl Thermal {
     }
 
     fn temperature_update(&mut self) {
-        self.core_temperature = self
+        let core_temperature = self
             .nodes
             .iter()
             .filter_map(|path| fs::read_to_string(path).ok())
             .map(|temp| temp.trim().parse::<u64>().unwrap_or_default())
-            .max()
-            .unwrap_or_default();
+            .max();
+        self.core_temperature = core_temperature.unwrap_or_default();
     }
 }

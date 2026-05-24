@@ -181,7 +181,7 @@ impl Analyzer {
         let deadline = Instant::now() + timeout;
         let mut polled_once = false;
 
-        let result = 'recv: loop {
+        'recv: loop {
             while let Some(pid) = self.buffer.pop_front() {
                 if let Some(weights) = self.process_pid_update(pid) {
                     break 'recv Ok((pid, weights));
@@ -226,9 +226,7 @@ impl Analyzer {
                     break Err(RecvTimeoutError::Disconnected);
                 }
             }
-        };
-
-        result
+        }
     }
 
     pub fn latest_for(&self, pid: i32) -> Option<&PolicyWeights> {
@@ -458,7 +456,6 @@ impl AnalyzeTarget {
 
         collect_dag_frame(
             self.uprobe.bpf_mut(),
-            closed_frame_id,
             bank,
             &self.stats_map_fds,
             &self.edge_map_fds,
@@ -592,12 +589,9 @@ fn attach_frame_uprobe(bpf: &mut Ebpf, pid: i32, cfg: &AnalyzerConfig) -> Result
         }
     }
 
-    Err(anyhow!(
-        "attach frame_point failed: {}",
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
-    ))
+    let last_err = last_err.map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+
+    Err(anyhow!("attach frame_point failed: {}", last_err))
 }
 
 fn attach_sched_tracepoints(bpf: &mut Ebpf) -> Result<()> {
@@ -852,9 +846,9 @@ struct PolicyWeightRow {
     smooth_norm_score: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_dag_frame(
     ebpf: &mut Ebpf,
-    _frame_id: u64,
     bank: u32,
     stats_map_fds: &[RawFd],
     edge_map_fds: &[RawFd],
@@ -938,8 +932,8 @@ fn pull_tid_policy_stats_map(
         keys_buf.push(k);
     }
 
-    for k in keys_buf.iter().copied() {
-        let _ = map.remove(&k);
+    for k in keys_buf.iter() {
+        let _ = map.remove(k);
     }
     keys_buf.clear();
 
@@ -983,8 +977,8 @@ fn pull_edge_map(
         keys_buf.push(k);
     }
 
-    for k in keys_buf.iter().copied() {
-        let _ = map.remove(&k);
+    for k in keys_buf.iter() {
+        let _ = map.remove(k);
     }
     keys_buf.clear();
 
@@ -1255,10 +1249,12 @@ fn infer_critical_subgraph(
         );
     }
 
-    let best_path_ns = (*score_to_head
+    let tail_total_ns = frame.thread_total_ns(tail_tid);
+    let best_path_ns = score_to_head
         .get(&tail_tid)
-        .unwrap_or(&frame.thread_total_ns(tail_tid)))
-    .max(frame.thread_total_ns(tail_tid));
+        .copied()
+        .unwrap_or(tail_total_ns)
+        .max(tail_total_ns);
 
     let longest_chain = build_longest_chain_from_tail(tail_tid, frame, &pred, &score_to_head);
     let longest_nodes: HashSet<u32> = longest_chain.iter().copied().collect();
@@ -1268,8 +1264,8 @@ fn infer_critical_subgraph(
 
     for tid in &reachable {
         let own = frame.thread_total_ns(*tid);
-        let head = *score_to_head.get(tid).unwrap_or(&own);
-        let tail = *score_to_tail.get(tid).unwrap_or(&own);
+        let head = score_to_head.get(tid).copied().unwrap_or(own);
+        let tail = score_to_tail.get(tid).copied().unwrap_or(own);
         let through = head
             .saturating_add(tail)
             .saturating_sub(own)
@@ -1402,10 +1398,8 @@ fn build_longest_chain_from_tail(
 
     let mut cur = tail_tid;
     for _ in 0..64 {
-        let cur_head = *score_to_head
-            .get(&cur)
-            .unwrap_or(&frame.thread_total_ns(cur));
         let cur_own = frame.thread_total_ns(cur);
+        let cur_head = score_to_head.get(&cur).copied().unwrap_or(cur_own);
         let target_gain = cur_head.saturating_sub(cur_own);
 
         let mut best_prev = None;
@@ -1415,9 +1409,10 @@ fn build_longest_chain_from_tail(
                 if seen.contains(prev_tid) {
                     continue;
                 }
-                let prev_head = *score_to_head
+                let prev_head = score_to_head
                     .get(prev_tid)
-                    .unwrap_or(&frame.thread_total_ns(*prev_tid));
+                    .copied()
+                    .unwrap_or_else(|| frame.thread_total_ns(*prev_tid));
                 let gain = prev_head.saturating_add(*edge_ns);
                 if gain > best_prev_gain {
                     best_prev_gain = gain;
@@ -1482,6 +1477,7 @@ fn critical_subgraph_to_frame_stats(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_cluster_weights(
     frame: &FrameStats,
     policies: &[u32],

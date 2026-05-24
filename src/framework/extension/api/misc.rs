@@ -22,7 +22,7 @@ use log::error;
 use mlua::{Function, IntoLuaMulti, Lua};
 
 pub fn get_api_version(lua: &Lua) -> u8 {
-    lua.globals().get("API_VERSION").unwrap_or(0)
+    lua.globals().get("API_VERSION").unwrap_or_default()
 }
 
 pub fn do_callback<P, S, A>(extension: P, lua: &Lua, function: S, args: A)

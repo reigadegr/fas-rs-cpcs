@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow()]
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_ktime_get_ns},

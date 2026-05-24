@@ -35,7 +35,7 @@ struct CpuUsageTracker {
 }
 
 impl CpuUsageTracker {
-    fn new(cpu_label: &'static str) -> Self {
+    const fn new(cpu_label: &'static str) -> Self {
         Self {
             cpu_label,
             last_busy: 0,
@@ -106,7 +106,7 @@ fn get_cpu_busy_total(cpu_label: &str) -> Result<(u64, u64)> {
             && line
                 .as_bytes()
                 .get(cpu_label.len())
-                .is_some_and(|b| b.is_ascii_whitespace())
+                .is_some_and(u8::is_ascii_whitespace)
     }) else {
         return Ok((0, 0));
     };
@@ -120,12 +120,8 @@ fn get_cpu_busy_total(cpu_label: &str) -> Result<(u64, u64)> {
         return Ok((0, 0));
     }
 
-    let busy = fields.first().copied().unwrap_or(0)
-        + fields.get(1).copied().unwrap_or(0)
-        + fields.get(2).copied().unwrap_or(0)
-        + fields.get(5).copied().unwrap_or(0)
-        + fields.get(6).copied().unwrap_or(0)
-        + fields.get(7).copied().unwrap_or(0);
+    let field = |idx| fields.get(idx).copied().unwrap_or_default();
+    let busy = field(0) + field(1) + field(2) + field(5) + field(6) + field(7);
     let total = fields.iter().sum();
 
     Ok((busy, total))

@@ -21,6 +21,7 @@ pub struct Event {
 }
 
 impl Event {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         ktime_ns: u64,
         pid: u32,

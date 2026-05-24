@@ -183,18 +183,18 @@ impl Looper {
     }
 
     fn switch_mode(&mut self) {
-        if let Ok(new_mode) = self.node.get_mode() {
-            if likely(self.fas_state.mode != new_mode) {
-                info!("Switch mode: {} -> {}", self.fas_state.mode, new_mode);
-                self.fas_state.mode = new_mode;
+        if let Ok(new_mode) = self.node.get_mode()
+            && likely(self.fas_state.mode != new_mode)
+        {
+            info!("Switch mode: {} -> {}", self.fas_state.mode, new_mode);
+            self.fas_state.mode = new_mode;
 
-                if self.fas_state.working_state == State::Working {
-                    self.controller_state.controller.init_game(
-                        self.fas_state.buffer.as_ref().unwrap().package_info.pid,
-                        &self.extension,
-                    );
-                    self.controller_state.error_ratio_ema = None;
-                }
+            if self.fas_state.working_state == State::Working {
+                self.controller_state.controller.init_game(
+                    self.fas_state.buffer.as_ref().unwrap().package_info.pid,
+                    &self.extension,
+                );
+                self.controller_state.error_ratio_ema = None;
             }
         }
     }
@@ -226,14 +226,17 @@ impl Looper {
         self.publish_cpcs_targets(cpcs_changed);
     }
 
-    fn cpcs_weights_for(&mut self, pid: i32) -> Option<cpcs_analyzer::PolicyWeights> {
+    fn cpcs_weights_for(&self, pid: i32) -> Option<cpcs_analyzer::PolicyWeights> {
         let now = Instant::now();
         let latest = self.cpcs_state.latest.lock().ok()?;
         let item = latest.get(&pid)?;
         if now.duration_since(item.received_at) > CPCS_STALE_TIMEOUT {
+            drop(latest);
             return None;
         }
-        Some(item.data.clone())
+        let data = item.data.clone();
+        drop(latest);
+        Some(data)
     }
 
     fn restart_analyzer(&mut self) {
@@ -265,11 +268,14 @@ impl Looper {
                     self.fas_state.mode,
                     &mut self.controller_state,
                     target_fps_offset,
-                )
-                .unwrap_or(ControlOutput {
-                    control_ratio: 0.0,
-                    is_janked: false,
-                });
+                );
+                let result = result.map_or(
+                    ControlOutput {
+                        control_ratio: 0.0,
+                        is_janked: false,
+                    },
+                    |result| result,
+                );
                 (buffer.package_info.pid, result.control_ratio, result.is_janked)
             } else {
                 return;
@@ -290,25 +296,23 @@ impl Looper {
     pub fn retain_topapp(&mut self) {
         self.prune_stale_cpcs_attachments();
 
-        if let Some(buffer) = self.fas_state.buffer.as_ref() {
-            if !self
-                .windows_watcher
-                .topapp_pids()
-                .contains(&buffer.package_info.pid)
-            {
-                let _ = self
-                    .analyzer_state
-                    .analyzer
-                    .detach_app(buffer.package_info.pid);
-                let mut cpcs_changed = false;
-                if self.cpcs_attached.remove(&buffer.package_info.pid) {
-                    cpcs_changed = true;
-                }
-                self.publish_cpcs_targets(cpcs_changed);
-                let pkg = buffer.package_info.pkg.clone();
-                trigger_unload_fas(&self.extension, buffer.package_info.pid, pkg);
-                self.fas_state.buffer = None;
-            }
+        let stale_buffer = self
+            .fas_state
+            .buffer
+            .as_ref()
+            .filter(|buffer| {
+                !self
+                    .windows_watcher
+                    .topapp_pids()
+                    .contains(&buffer.package_info.pid)
+            })
+            .map(|buffer| (buffer.package_info.pid, buffer.package_info.pkg.clone()));
+        if let Some((pid, pkg)) = stale_buffer {
+            let _ = self.analyzer_state.analyzer.detach_app(pid);
+            let cpcs_changed = self.cpcs_attached.remove(&pid);
+            self.publish_cpcs_targets(cpcs_changed);
+            trigger_unload_fas(&self.extension, pid, pkg);
+            self.fas_state.buffer = None;
         }
 
         if self.fas_state.buffer.is_none() {
@@ -389,7 +393,7 @@ impl Looper {
         }
 
         if let Ok(mut desired) = self.cpcs_state.desired.lock() {
-            *desired = self.cpcs_attached.clone();
+            (*desired).clone_from(&self.cpcs_attached);
         }
         self.cpcs_state.generation.fetch_add(1, Ordering::Release);
         self.cpcs_state.worker.unpark();
@@ -439,7 +443,7 @@ fn spawn_cpcs_worker(analyzer: CpcsAnalyzer) -> CpcsState {
     let worker = thread::Builder::new()
         .name("cpcs".to_string())
         .spawn(move || {
-            cpcs_worker_loop(analyzer, desired_worker, generation_worker, latest_worker)
+            cpcs_worker_loop(analyzer, desired_worker, generation_worker, latest_worker);
         })
         .expect("failed to spawn cpcs worker")
         .thread()
@@ -453,6 +457,7 @@ fn spawn_cpcs_worker(analyzer: CpcsAnalyzer) -> CpcsState {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn cpcs_worker_loop(
     mut analyzer: CpcsAnalyzer,
     desired: Arc<Mutex<HashSet<i32>>>,
@@ -502,7 +507,9 @@ fn reconcile_cpcs_targets(
     latest: &Arc<Mutex<HashMap<i32, TimedCpcsWeights>>>,
     attached: &mut HashSet<i32>,
 ) {
-    let desired_snapshot = desired.lock().map(|set| set.clone()).unwrap_or_default();
+    let desired_snapshot = desired
+        .lock()
+        .map_or_else(|_| HashSet::new(), |set| set.clone());
 
     let stale: Vec<i32> = attached
         .iter()
@@ -531,7 +538,7 @@ fn reconcile_cpcs_targets(
 
     let live: HashSet<i32> = analyzer.pids().collect();
     if *attached != live {
-        *attached = live.clone();
+        attached.clone_from(&live);
     }
     if let Ok(mut guard) = latest.lock() {
         guard.retain(|pid, _| live.contains(pid));

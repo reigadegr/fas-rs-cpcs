@@ -60,17 +60,18 @@ pub fn calculate_control(
 }
 
 fn get_normalized_last_frame(buffer: &Buffer, target_fps: f64) -> Duration {
+    const SHORT_AVG_BLEND: f64 = 0.30;
+
     let last_frame = buffer
         .frametime_state
         .frametimes
         .front()
         .copied()
-        .unwrap_or_default();
+        .unwrap_or(Duration::ZERO);
     let short_avg_frame = buffer.frametime_state.avg_time_short;
 
     // Symmetric blend between single-frame and short-window frame time.
     // This keeps responsiveness while reducing one-frame catch-up noise.
-    const SHORT_AVG_BLEND: f64 = 0.30;
     let beta = SHORT_AVG_BLEND.clamp(0.0, 1.0);
     let representative = last_frame
         .mul_f64(1.0 - beta)
@@ -106,14 +107,13 @@ fn calculate_control_inner(
     // EMA filter suppresses one-frame noise before converting error into
     // control action.
     let alpha = controller_state.params.error_ema_alpha.clamp(0.0, 0.9999);
-    let smooth_error_ratio = if let Some(prev) = controller_state.error_ratio_ema {
-        alpha * prev + (1.0 - alpha) * clipped_raw_error_ratio
-    } else {
-        clipped_raw_error_ratio
-    };
+    #[allow(clippy::suboptimal_flops)]
+    let smooth_error_ratio = controller_state
+        .error_ratio_ema
+        .map_or(clipped_raw_error_ratio, |prev| {
+            alpha * prev + (1.0 - alpha) * clipped_raw_error_ratio
+        });
     controller_state.error_ratio_ema = Some(smooth_error_ratio);
 
-    let error_p = smooth_error_ratio * controller_state.params.kp;
-
-    error_p
+    smooth_error_ratio * controller_state.params.kp
 }

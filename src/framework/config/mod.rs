@@ -61,7 +61,9 @@ impl Config {
             thread::Builder::new()
                 .name("ConfigThread".into())
                 .spawn(move || {
-                    wait_and_read(&path, &std_path, &sx).unwrap_or_else(|e| error!("{e:#?}"));
+                    if let Err(e) = wait_and_read(&path, &std_path, &sx) {
+                        error!("{e:#?}");
+                    }
                     panic!("An unrecoverable error occurred!");
                 })?;
         }
@@ -107,14 +109,8 @@ impl Config {
                     Some(TargetFps::Array(arr))
                 }
                 Value::Integer(i) => Some(TargetFps::Value(i as u32)),
-                Value::String(s) => {
-                    if s == "auto" {
-                        Some(TargetFps::Array(vec![30, 45, 60, 90, 120, 144]))
-                    } else {
-                        error!("Find target game {pkg} in config, but meet illegal data type");
-                        error!("Sugg: try \'{pkg} = \"auto\"\'");
-                        None
-                    }
+                Value::String(s) if s == "auto" => {
+                    Some(TargetFps::Array(vec![30, 45, 60, 90, 120, 144]))
                 }
                 _ => {
                     error!("Find target game {pkg} in config, but meet illegal data type");

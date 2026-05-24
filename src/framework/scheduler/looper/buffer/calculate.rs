@@ -53,23 +53,20 @@ impl Buffer {
     }
 
     fn calculate_average_frametime(&self, it_takes: Option<usize>) -> Duration {
+        let frametime_count = self.frametime_state.frametimes.len();
+        let take_count = it_takes.unwrap_or(frametime_count);
         let total_time: Duration = self
             .frametime_state
             .frametimes
             .iter()
-            .take(it_takes.unwrap_or(self.frametime_state.frametimes.len()))
+            .take(take_count)
             .sum::<Duration>()
             .saturating_add(self.frametime_state.additional_frametime);
 
+        let divisor = take_count.min(frametime_count).try_into().unwrap();
         total_time
-            .checked_div(
-                it_takes
-                    .unwrap_or(self.frametime_state.frametimes.len())
-                    .min(self.frametime_state.frametimes.len())
-                    .try_into()
-                    .unwrap(),
-            )
-            .unwrap_or_default()
+            .checked_div(divisor)
+            .unwrap_or(Duration::ZERO)
     }
 
     pub fn calculate_target_fps(&mut self, extension: &Extension) {

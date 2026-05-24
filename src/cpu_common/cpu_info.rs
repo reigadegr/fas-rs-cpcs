@@ -71,7 +71,7 @@ impl Info {
     }
 
     fn snap_to_available_freq(&self, freq: isize) -> isize {
-        let mut best = *self.freqs.first().unwrap_or(&freq);
+        let mut best = self.freqs.first().map_or(freq, |first| *first);
         let mut best_diff = (best as i64 - freq as i64).abs();
 
         for &candidate in self.freqs.iter().skip(1) {

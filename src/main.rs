@@ -22,7 +22,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
 )]
 
 mod cpu_common;
@@ -58,18 +58,18 @@ fn main() -> Result<()> {
         let local = fs::read_to_string(USER_CONFIG)?;
         let std = fs::read_to_string(&args[2])?;
 
-        let new = Config::merge(&local, &std).unwrap_or(std);
+        let new = Config::merge(&local, &std).map_or(std, |new| new);
         println!("{new}");
 
         return Ok(());
     } else if args[1] == "run" {
         setprop("fas-rs-server-started", "true");
-        run(&args[2]).unwrap_or_else(|e| {
+        if let Err(e) = run(&args[2]) {
             for cause in e.chain() {
                 error!("{cause:#?}");
             }
             error!("{:#?}", e.backtrace());
-        });
+        }
     }
 
     Ok(())
@@ -126,7 +126,12 @@ fn pin_self_to_cpu1() -> Result<()> {
     unsafe {
         libc::CPU_ZERO(&mut cpuset);
         libc::CPU_SET(1usize, &mut cpuset);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset) != 0 {
+        if libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            std::ptr::addr_of!(cpuset),
+        ) != 0
+        {
             return Err(io::Error::last_os_error().into());
         }
     }

@@ -203,7 +203,8 @@ impl Controller {
             maxs.push(max_freq as f64);
             caps.push(max_freq.saturating_sub(min_freq).max(0) as f64);
             alloc.push(0.0);
-            ws.push(weights.get(&info.policy).copied().unwrap_or(1.0).max(0.0));
+            let weight = weights.get(&info.policy).copied().unwrap_or(1.0);
+            ws.push(weight.max(0.0));
         }
         if policies.is_empty() {
             return out;
@@ -341,16 +342,15 @@ impl Controller {
             if let Some(max_freq) = cpu.freqs.last().copied() {
                 total_max = total_max.saturating_add(max_freq);
             }
-            let cur = cpu.cur_fas_freq.clamp(
-                cpu.freqs.first().copied().unwrap_or(cpu.cur_fas_freq),
-                cpu.freqs.last().copied().unwrap_or(cpu.cur_fas_freq),
-            );
+            let min = cpu.freqs.first().copied().unwrap_or(cpu.cur_fas_freq);
+            let max = cpu.freqs.last().copied().unwrap_or(cpu.cur_fas_freq);
+            let cur = cpu.cur_fas_freq.clamp(min, max);
             cur_total = cur_total.saturating_add(cur);
         }
 
         let base_total = self
             .total_budget_khz
-            .unwrap_or(cur_total)
+            .map_or(cur_total, |total_budget_khz| total_budget_khz)
             .clamp(total_min, total_max);
 
         let bounded_ratio = control_ratio.clamp(-0.8, 1.0);
@@ -430,22 +430,22 @@ impl Controller {
         sorted_policies: &[i32],
     ) -> HashMap<i32, isize> {
         for policy in sorted_policies {
-            if let Some(freq) = fas_freqs.get(policy).copied() {
-                if let ExtraPolicy::AbsRangeBound(ref abs_bound) = *EXTRA_POLICY_MAP
-                    .get()
-                    .context("EXTRA_POLICY_MAP not initialized")
-                    .unwrap()
-                    .get(policy)
-                    .context("CPU Policy not found")
-                    .unwrap()
-                    .lock()
-                {
-                    let clamped_freq = freq.clamp(
-                        abs_bound.min.unwrap_or(0),
-                        abs_bound.max.unwrap_or(isize::MAX),
-                    );
-                    fas_freqs.insert(*policy, clamped_freq);
-                }
+            let Some(freq) = fas_freqs.get(policy).copied() else {
+                continue;
+            };
+            if let ExtraPolicy::AbsRangeBound(ref abs_bound) = *EXTRA_POLICY_MAP
+                .get()
+                .context("EXTRA_POLICY_MAP not initialized")
+                .unwrap()
+                .get(policy)
+                .context("CPU Policy not found")
+                .unwrap()
+                .lock()
+            {
+                let min = abs_bound.min.unwrap_or_default();
+                let max = abs_bound.max.map_or(isize::MAX, |max| max);
+                let clamped_freq = freq.clamp(min, max);
+                fas_freqs.insert(*policy, clamped_freq);
             }
         }
 
@@ -468,14 +468,19 @@ impl Controller {
                     .lock()
                 {
                     ExtraPolicy::RelRangeBound(ref rel_bound) => {
-                        let rel_to_freq = fas_freqs.get(&rel_bound.rel_to).copied().unwrap_or(0);
+                        let rel_to_freq = fas_freqs
+                            .get(&rel_bound.rel_to)
+                            .copied()
+                            .unwrap_or_default();
 
                         #[cfg(debug_assertions)]
                         debug!("policy{policy} rel_to {rel_to_freq}");
 
+                        let min = rel_bound.min.map_or(isize::MIN, |min| min);
+                        let max = rel_bound.max.map_or(isize::MAX, |max| max);
                         freq.clamp(
-                            rel_to_freq + rel_bound.min.unwrap_or(isize::MIN),
-                            rel_to_freq + rel_bound.max.unwrap_or(isize::MAX),
+                            rel_to_freq + min,
+                            rel_to_freq + max,
                         )
                     }
                     _ => freq,

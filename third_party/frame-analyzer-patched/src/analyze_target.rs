@@ -22,6 +22,9 @@ use frame_analyzer_ebpf_common::FrameSignal;
 
 use crate::uprobe::UprobeHandler;
 
+const MIN_FRAME_NS: u64 = 1_000_000;
+const MAX_FRAME_NS: u64 = 200_000_000;
+
 pub struct AnalyzeTarget {
     pub uprobe: UprobeHandler,
     last_ktime_ns: Option<u64>,
@@ -41,8 +44,6 @@ impl AnalyzeTarget {
         let mut ring = self.uprobe.ring().unwrap();
         let item = ring.next()?;
         let event = unsafe { trans(&item) };
-        const MIN_FRAME_NS: u64 = 1_000_000;
-        const MAX_FRAME_NS: u64 = 200_000_000;
 
         if let Some(last_ns) = self.last_ktime_ns {
             let frametime_ns = event.ktime_ns.saturating_sub(last_ns);
