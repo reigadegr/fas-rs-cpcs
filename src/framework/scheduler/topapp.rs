@@ -127,7 +127,11 @@ impl TopAppsWatcher {
     pub fn new() -> Self {
         let windows_dumper = loop {
             match Dumpsys::new() {
-                Ok(d) => break d,
+                Ok(mut d) => {
+                    if d.insert_service("window").is_ok() {
+                        break d;
+                    }
+                }
                 Err(_) => std::thread::sleep(Duration::from_secs(1)),
             }
         };
