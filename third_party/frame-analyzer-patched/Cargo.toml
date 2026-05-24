@@ -38,10 +38,10 @@ version = "1"
 version = "0.13.1"
 
 [dependencies.ctor]
-version = "0.4.0"
+version = "1.0.6"
 
 [dependencies.ctrlc]
-version = "3.4.4"
+version = "3.5.2"
 
 [dependencies.frame-analyzer-ebpf-common]
 version = "0"
@@ -51,11 +51,11 @@ features = ["user"]
 version = "0.2"
 
 [dependencies.mio]
-version = "1.0.3"
+version = "1.2.0"
 features = ["os-ext"]
 
 [dependencies.thiserror]
-version = "2.0.11"
+version = "2.0.18"
 
 [build-dependencies.anyhow]
-version = "1.0.96"
+version = "1.0.102"

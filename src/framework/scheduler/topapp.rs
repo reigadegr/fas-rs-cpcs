@@ -126,9 +126,9 @@ pub struct TopAppsWatcher {
 impl TopAppsWatcher {
     pub fn new() -> Self {
         let windows_dumper = loop {
-            match Dumpsys::new("window") {
-                Some(d) => break d,
-                None => std::thread::sleep(Duration::from_secs(1)),
+            match Dumpsys::new() {
+                Ok(d) => break d,
+                Err(_) => std::thread::sleep(Duration::from_secs(1)),
             }
         };
 
@@ -150,7 +150,7 @@ impl TopAppsWatcher {
     fn cache(&mut self) -> &WindowsInfo {
         if self.last_refresh.elapsed() > REFRESH_TIME {
             let dump = loop {
-                match self.windows_dumper.dump(&["visible-apps"]) {
+                match self.windows_dumper.dump("window", &["visible-apps"]) {
                     Ok(dump) => break dump,
                     Err(e) => {
                         log::error!("Failed to dump windows: {e}, retrying");

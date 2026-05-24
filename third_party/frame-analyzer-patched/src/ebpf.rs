@@ -21,7 +21,7 @@ use ctor::ctor;
 
 use crate::error::Result;
 
-#[ctor]
+#[ctor(unsafe)]
 fn ebpf_workround() {
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/

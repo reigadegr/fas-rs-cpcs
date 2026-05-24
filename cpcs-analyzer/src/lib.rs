@@ -34,7 +34,7 @@ const DEFAULT_UPROBE_SYMBOL: &str =
 const LEGACY_UPROBE_SYMBOL: &str = "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi";
 const DEFAULT_UPROBE_LIB: &str = "/system/lib64/libgui.so";
 
-#[ctor]
+#[ctor(unsafe)]
 fn ebpf_workaround() {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
