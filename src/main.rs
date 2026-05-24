@@ -122,18 +122,8 @@ fn log_format(
 }
 
 fn pin_self_to_cpu1() -> Result<()> {
-    let mut cpuset = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-    unsafe {
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(1usize, &mut cpuset);
-        if libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            std::ptr::addr_of!(cpuset),
-        ) != 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
+    let mut cpuset = rustix::thread::CpuSet::new();
+    cpuset.set(1);
+    rustix::thread::sched_setaffinity(None, &cpuset)?;
     Ok(())
 }

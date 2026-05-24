@@ -17,14 +17,12 @@
 
 use std::{
     collections::HashMap,
-    ffi::CString,
     fs::{self, set_permissions},
     os::unix::fs::PermissionsExt,
     path::Path,
-    ptr,
 };
 
-use libc::{MS_BIND, MS_REC, mount, umount, umount2};
+use rustix::mount::UnmountFlags;
 
 use crate::framework::error::Result;
 
@@ -48,32 +46,13 @@ where
 }
 
 fn mount_bind(src_path: &str, dest_path: &str) -> Result<()> {
-    let src_path = CString::new(src_path)?;
-    let dest_path = CString::new(dest_path)?;
-
-    unsafe {
-        umount2(dest_path.as_ptr(), libc::MNT_DETACH);
-
-        if mount(
-            src_path.as_ptr().cast(),
-            dest_path.as_ptr().cast(),
-            ptr::null(),
-            MS_BIND | MS_REC,
-            ptr::null(),
-        ) != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-
+    let _ = rustix::mount::unmount(dest_path, UnmountFlags::DETACH);
+    rustix::mount::mount_bind_recursive(src_path, dest_path).map_err(std::io::Error::from)?;
     Ok(())
 }
 
 fn unmount(file_system: &str) -> Result<()> {
-    let path = CString::new(file_system)?;
-    if unsafe { umount(path.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    rustix::mount::unmount(file_system, UnmountFlags::empty()).map_err(std::io::Error::from)?;
     Ok(())
 }
 

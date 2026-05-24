@@ -811,6 +811,7 @@ dependencies = [
  "parking_lot",
  "quick-xml",
  "rocket",
+ "rustix",
  "serde",
  "serde_json",
  "sys-mount",

@@ -62,6 +62,7 @@ anyhow = { version = "1.0.102" }
 inotify = { version = "0.11.1", default-features = false }
 flexi_logger = "0.31.9"
 libc = "0.2.186"
+rustix = { version = "1.1.4", features = ["mount", "thread"] }
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 sys-mount = { version = "3.1.0", default-features = false }
