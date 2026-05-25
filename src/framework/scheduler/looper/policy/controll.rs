@@ -45,7 +45,7 @@ pub fn calculate_control(
     assert!(margin_fps.is_sign_positive(), "margin_fps must be positive");
 
     let target_fps = (target_fps + target_fps_offset_thermal).clamp(0.0, target_fps);
-    let adjusted_target_fps = target_fps - margin_fps;
+    let adjusted_target_fps = (target_fps - margin_fps).max(0.0);
 
     let adjusted_last_frame = get_normalized_last_frame(buffer, adjusted_target_fps);
     let target_frametime = Duration::from_secs(1);
