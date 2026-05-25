@@ -111,18 +111,25 @@ fn get_cpu_busy_total(cpu_label: &str) -> Result<(u64, u64)> {
         return Ok((0, 0));
     };
 
-    let fields: Vec<u64> = line
+    let mut has_fields = false;
+    let mut busy = 0;
+    let mut total = 0;
+    for (idx, value) in line
         .split_whitespace()
         .skip(1)
         .filter_map(|value| value.parse::<u64>().ok())
-        .collect();
-    if fields.is_empty() {
-        return Ok((0, 0));
+        .enumerate()
+    {
+        has_fields = true;
+        total += value;
+        if matches!(idx, 0 | 1 | 2 | 5 | 6 | 7) {
+            busy += value;
+        }
     }
 
-    let field = |idx| fields.get(idx).copied().unwrap_or_default();
-    let busy = field(0) + field(1) + field(2) + field(5) + field(6) + field(7);
-    let total = fields.iter().sum();
+    if !has_fields {
+        return Ok((0, 0));
+    }
 
     Ok((busy, total))
 }
