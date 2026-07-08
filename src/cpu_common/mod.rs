@@ -346,7 +346,7 @@ impl Controller {
 
         let base_total = self
             .total_budget_khz
-            .map_or(cur_total, |total_budget_khz| total_budget_khz)
+            .unwrap_or(cur_total)
             .clamp(total_min, total_max);
 
         let bounded_ratio = control_ratio.clamp(-0.8, 1.0);
@@ -439,7 +439,7 @@ impl Controller {
                 .lock()
             {
                 let min = abs_bound.min.unwrap_or_default();
-                let max = abs_bound.max.map_or(isize::MAX, |max| max);
+                let max = abs_bound.max.unwrap_or(isize::MAX);
                 let clamped_freq = freq.clamp(min, max);
                 fas_freqs.insert(*policy, clamped_freq);
             }
@@ -472,8 +472,8 @@ impl Controller {
                         #[cfg(debug_assertions)]
                         debug!("policy{policy} rel_to {rel_to_freq}");
 
-                        let min = rel_bound.min.map_or(isize::MIN, |min| min);
-                        let max = rel_bound.max.map_or(isize::MAX, |max| max);
+                        let min = rel_bound.min.unwrap_or(isize::MIN);
+                        let max = rel_bound.max.unwrap_or(isize::MAX);
                         freq.clamp(rel_to_freq + min, rel_to_freq + max)
                     }
                     _ => freq,

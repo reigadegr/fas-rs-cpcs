@@ -268,13 +268,10 @@ impl Looper {
                 &mut self.controller_state,
                 target_fps_offset,
             );
-            let result = result.map_or(
-                ControlOutput {
-                    control_ratio: 0.0,
-                    is_janked: false,
-                },
-                |result| result,
-            );
+            let result = result.unwrap_or(ControlOutput {
+                control_ratio: 0.0,
+                is_janked: false,
+            });
             (
                 buffer.package_info.pid,
                 result.control_ratio,

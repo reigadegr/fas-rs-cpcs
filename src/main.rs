@@ -58,7 +58,7 @@ fn main() -> Result<()> {
         let local = fs::read_to_string(USER_CONFIG)?;
         let std = fs::read_to_string(&args[2])?;
 
-        let new = Config::merge(&local, &std).map_or(std, |new| new);
+        let new = Config::merge(&local, &std).unwrap_or(std);
         println!("{new}");
 
         return Ok(());
