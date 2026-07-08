@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 cpcs-analyzer-common = { path = "../cpcs-analyzer-common" }
-aya-ebpf = "0.1.1"
+aya-ebpf = "0.2.1"
 
 [[bin]]
 name = "cpcs-analyzer"

@@ -16,13 +16,18 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+use std::num::NonZeroU32;
+
 use aya::{
     Ebpf,
     maps::{MapData, RingBuf},
-    programs::UProbe,
+    programs::{UProbe, uprobe::UProbeScope},
 };
 
-use crate::{ebpf::load_bpf, error::Result};
+use crate::{
+    ebpf::load_bpf,
+    error::{AnalyzerError, Result},
+};
 
 pub struct UprobeHandler {
     bpf: Ebpf,
@@ -42,17 +47,16 @@ impl UprobeHandler {
 
         let program: &mut UProbe = bpf.program_mut("frame_analyzer_ebpf").unwrap().try_into()?;
         program.load()?;
+        let pid = NonZeroU32::new(pid as u32).ok_or(AnalyzerError::AppNotFound)?;
         program.attach(
-            Some("_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi"),
-            0,
+            "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi",
             "/system/lib64/libgui.so",
-            Some(pid),
+            UProbeScope::OneProcess(pid),
         ).or_else(|_e1| {
             program.attach(
-                Some("_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE"),
-                0,
+                "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE",
                 "/system/lib64/libgui.so",
-                Some(pid),
+                UProbeScope::OneProcess(pid),
             )
         })?;
 

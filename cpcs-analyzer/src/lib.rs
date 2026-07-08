@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs, io,
+    num::NonZeroU32,
     os::fd::{AsFd, AsRawFd, RawFd},
     path::Path,
     ptr,
@@ -12,7 +13,7 @@ use anyhow::{Result, anyhow};
 use aya::{
     Ebpf, include_bytes_aligned,
     maps::{Array, HashMap as UserHashMap, IterableMap, MapData, RingBuf},
-    programs::{TracePoint, UProbe},
+    programs::{TracePoint, UProbe, uprobe::UProbeScope},
 };
 use cpcs_analyzer_common::{DagThreadMetrics, Event, EventKind};
 use ctor::ctor;
@@ -561,6 +562,8 @@ fn load_bpf() -> Result<Ebpf> {
 fn attach_frame_uprobe(bpf: &mut Ebpf, pid: i32, cfg: &AnalyzerConfig) -> Result<()> {
     let program: &mut UProbe = bpf.program_mut("frame_point").unwrap().try_into()?;
     program.load()?;
+    let pid = NonZeroU32::new(pid.try_into().map_err(|_| anyhow!("invalid pid: {pid}"))?)
+        .ok_or_else(|| anyhow!("invalid pid: {pid}"))?;
 
     // Mirror frame-analyzer's proven attach order for Android compatibility.
     let candidates = if cfg.uprobe_symbol != DEFAULT_UPROBE_SYMBOL
@@ -582,7 +585,11 @@ fn attach_frame_uprobe(bpf: &mut Ebpf, pid: i32, cfg: &AnalyzerConfig) -> Result
             continue;
         }
 
-        match program.attach(Some(symbol), 0, cfg.uprobe_lib.as_str(), Some(pid)) {
+        match program.attach(
+            symbol,
+            cfg.uprobe_lib.as_str(),
+            UProbeScope::OneProcess(pid),
+        ) {
             Ok(_) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
